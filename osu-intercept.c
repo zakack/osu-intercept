@@ -5,129 +5,68 @@
 #include <string.h>
 #include <linux/input.h>
 
-#define GRAPE KEY_F13
-#define BROCCOLI KEY_F14
+#define K1 KEY_Z
+#define K2 KEY_X
 
-// Direct inline emit function for maximum performance
-static inline void emit(int fd, int type, int code, int val) {
+/* write key release event to stdout */
+static inline void keyup(int code) {
     struct input_event ie = {0};
-    ie.type = type;
+    ie.type = EV_KEY;
     ie.code = code;
-    ie.value = val;
-    write(fd, &ie, sizeof(ie));
-}
-
-static inline void syn(int fd) {
-    struct input_event ie = {0};
-    ie.type = EV_SYN;
-    ie.code = SYN_REPORT;
     ie.value = 0;
-    write(fd, &ie, sizeof(ie));
-}
-
-// Optimized register/unregister with inline syn
-static inline void register_code(int code) {
-    emit(STDOUT_FILENO, EV_KEY, code, 1);
-    syn(STDOUT_FILENO);
-}
-
-static inline void unregister_code(int code) {
-    emit(STDOUT_FILENO, EV_KEY, code, 0);
-    syn(STDOUT_FILENO);
+    write(STDOUT_FILENO, &ie, sizeof(ie));
 }
 
 int main(void) {
     setbuf(stdin, NULL);
     setbuf(stdout, NULL);
-
     struct input_event ie;
-    int key1_pressed = 0, key2_pressed = 0;
-    int grape_down = 0, broccoli_down = 0;
-    unsigned short last_key1 = 0, last_key2 = 0;
-
+    struct input_event syn = {
+        .type = EV_SYN,
+        .code = SYN_REPORT, 
+        .value = 0
+    };
+    enum State {
+        NONE,
+        RELEASE,
+        SINGLE,
+        PRESS
+    };
+    int k1 = 0; int k2 = 0;
+    int act = 0;
     while (fread(&ie, sizeof(ie), 1, stdin) == 1) {
-        // Ignore EV_MSC events
+        //ignore EV_MSC events
         if (ie.type == EV_MSC && ie.code == MSC_SCAN)
             continue;
-        // Ignore GRAPE or BROCCOLI events
-        if (ie.code == GRAPE || ie.code == BROCCOLI)
-            continue;
-        // Pass through !EV_KEY events
-        if (ie.type != EV_KEY) {
+        //pass through non-key events and untracked keys
+        if ((ie.type != EV_KEY) || 
+            ((ie.code != K1) && (ie.code != K2))) {
             fwrite(&ie, sizeof(ie), 1, stdout);
             continue;
         }
-
-        // Handle key press events
-        if (ie.value == 1) { // Key pressed
-            if (ie.code == last_key1) {
-                key1_pressed = 1;
-            } else if (ie.code == last_key2) {
-                key2_pressed = 1;
-            } else {
-                // New key: Shift and update states
-                last_key1 = last_key2;
-                last_key2 = ie.code;
-                key1_pressed = key2_pressed;
-                key2_pressed = 1;
-            }
-            if (key1_pressed && key2_pressed) {
-                // Inline toggle logic for dual-key state
-                if (grape_down) unregister_code(GRAPE);
-                else register_code(GRAPE);
-                grape_down = !grape_down;
-                if (broccoli_down) unregister_code(BROCCOLI);
-                else register_code(BROCCOLI);
-                broccoli_down = !broccoli_down;
-            } else {
-                // Single key behavior (completed based on context)
-                int new_grape = (ie.code == last_key1);
-                int new_broccoli = !new_grape;
-                if (grape_down != new_grape) {
-                    if (grape_down) unregister_code(GRAPE);
-                    else if (new_grape) register_code(GRAPE);
-                    grape_down = new_grape;
-                }
-                if (broccoli_down != new_broccoli) {
-                    if (broccoli_down) unregister_code(BROCCOLI);
-                    else if (new_broccoli) register_code(BROCCOLI);
-                    broccoli_down = new_broccoli;
-                }
-            }
-        // Handle key release events
-        } else if (ie.value == 0) {
-            if (ie.code == last_key1) {
-                key1_pressed = 0;
-            } else if (ie.code == last_key2) {
-                key2_pressed = 0;
-            }
-            if (key1_pressed || key2_pressed) {
-                // Inline toggle for remaining key
-                if (grape_down) unregister_code(GRAPE);
-                else register_code(GRAPE);
-                grape_down = !grape_down;
-                if (broccoli_down) unregister_code(BROCCOLI);
-                else register_code(BROCCOLI);
-                broccoli_down = !broccoli_down;
-            } else {
-                // Both released: Reset to off
-                if (grape_down) unregister_code(GRAPE);
-                if (broccoli_down) unregister_code(BROCCOLI);
-                grape_down = 0;
-                broccoli_down = 0;
-            }
-            // Update pressed state
-            if (ie.code == last_key2) {
-                key2_pressed = 0;
-            } else if (ie.code == last_key1) {
-                key1_pressed = 0;
-            }
+        //track K1/K2
+        if (ie.code == K1) k1 = ie.value;
+        else k2 = ie.value;
+        enum State state = k1 + k2 + ie.value;
+        switch (state) {
+            case RELEASE: //key pressed or released
+            case PRESS:   //with one already pressed
+            ie.value = 1;         //hijack press event
+            keyup(act ? K1 : K2); //emit release
+            ie.code = act ? K2 : K1;
+            act = !act; //toggle
+            fwrite(&ie, sizeof(ie), 1, stdout); //pass on event to stdout
+            write(STDOUT_FILENO, &syn, sizeof(syn)); //flush buffer
+            continue;
+            case SINGLE: //key pressed alone
+            if (ie.code == K2) break;
+            act = !act; //set act flag if K1
+            break;
+            case NONE: //no keys pressed
+            ie.code = act ? K1 : K2;
+            act = 0;  //reset virtual state
         }
-        // Pass through the original event
-        fwrite(&ie, sizeof(ie), 1, stdout);
+        fwrite(&ie, sizeof(ie), 1, stdout); //pass on event to stdout
     }
-    // Clean up on exit
-    if (grape_down) unregister_code(GRAPE);
-    if (broccoli_down) unregister_code(BROCCOLI);
     return 0;
 }
