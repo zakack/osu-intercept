@@ -59,8 +59,7 @@ int main(void) {
             write(STDOUT_FILENO, &syn, sizeof(syn)); //flush buffer
             continue;
             case SINGLE: //key pressed alone
-            if (ie.code == K2) break;
-            act = !act; //set act flag if K1
+            if (ie.code == K1) act = !act; //set act flag if K1
             break;
             case NONE: //no keys pressed
             ie.code = act ? K1 : K2;
