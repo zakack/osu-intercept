@@ -98,8 +98,8 @@ int main(int argc, char *argv[]) {
         state = k1 + k2 + ie.value;
         switch (state) {
             case SINGLE: //key pressed alone
-            act = (ie.code == k1_code) ? 1 : 0; //k1_code==v1_code press
-            ie.code = (ie.code == k1_code) ? v1_code : v2_code;
+            act = (ie.code == k1_code); //k1_code==v1_code press
+            ie.code = act ? v1_code : v2_code;
             break;
             case RELEASE: //two keys released to one or
             case PRESS:   //one key pressed to two, toggle time
