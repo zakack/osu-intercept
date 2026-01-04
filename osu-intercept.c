@@ -92,7 +92,7 @@ int main(int argc, char *argv[]) {
               write_ev(&ie);
             continue;
         }
-        if (ie.value == 2) ie.value = 1; //2 is key repeat
+        if (ie.value == 2) continue; //2 is key repeat
         if (ie.code == k1_code) k1 = ie.value;
         else k2 = ie.value;
         state = k1 + k2 + ie.value;
