@@ -44,11 +44,27 @@ keys:
   v1: KEY_Z
   v2: KEY_X
 
-# Audio click on each virtual keypress. `wav` defaults to the click sample
-# installed alongside this file; point it at any 16/24/32-bit PCM WAV.
+# Audio click on each virtual keypress, played through PipeWire.
+#
+# `wav` is the base sample and `gain` (linear, 1.0 = unity) the base volume,
+# used for BOTH virtual keys unless overridden per-key below.
+#
+# Per-key overrides let V1 and V2 have their own sound and/or volume:
+#   wav_v1 / wav_v2   - separate samples for the two keys (each falls back
+#                       to `wav` when omitted)
+#   gain_v1 / gain_v2 - separate volumes (each falls back to `gain`)
+# The two voices play on independent streams, so a V1 click and a V2 click
+# overlap rather than cutting each other off. Setting `wav` alongside a
+# single override is fine (not a conflict): the override wins for its key,
+# `wav` covers the other. Point samples at any 16/24/32-bit PCM WAV.
 audio:
   enabled: true
   wav: /usr/share/doubletap/click.wav
+  gain: 1.0
+  # wav_v1: /usr/share/doubletap/click.wav
+  # wav_v2: /usr/share/doubletap/clack.wav
+  # gain_v1: 1.0
+  # gain_v2: 0.8
 
 # Identification of the virtual uinput keyboard.
 uinput:
