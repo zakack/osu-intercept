@@ -35,7 +35,7 @@ re-pressed key.
   explicit device list.
 - **Multiple keyboards** — each physical keyboard gets its own independent
   SOCD state, all funneled into one virtual output device.
-- **Audio click** — a WAV sample (16/24/32-bit PCM) played via PipeWire on
+- **Audio click** — separate WAV samples (16/24/32-bit PCM) played via PipeWire on
   every virtual key-down, from a dedicated realtime audio thread.
 - **Low latency** — single-threaded epoll loop, best-effort `SCHED_FIFO`
   realtime scheduling, and `mlockall` when audio is enabled.
@@ -127,6 +127,11 @@ keys:                 # physical k1/k2 -> virtual v1/v2
 audio:
   enabled: true
   wav: /usr/share/doubletap/click.wav   # any 16/24/32-bit PCM WAV
+  gain: 1.0
+  # wav_v1: /usr/share/doubletap/click.wav # optional: separate
+  # wav_v2: /usr/share/doubletap/clack.wav # sound samples and
+  # gain_v1: 1.0                           # gains for v1 & v2
+  # gain_v2: 0.8
 
 uinput:
   name: "doubletap virtual keyboard"

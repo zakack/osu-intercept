@@ -94,19 +94,36 @@ static void logf_(const char *level, const char *fmt, ...) {
 
 static int audio_available;
 
-static struct {
+/* One playback voice: an independently loaded sample driven by its own
+ * PipeWire stream. V1 keypresses trigger voice 0, V2 voice 1. The two
+ * streams are fully independent so a V1 click and a V2 click overlap
+ * rather than cutting each other off. */
+#define AUDIO_NVOICES 2
+
+/* process_event() return codes: which virtual key it emitted a press for
+ * (and thus which hitsound voice to trigger). 0 = no press this event. */
+#define VOICE_NONE 0
+#define VOICE_V1   1
+#define VOICE_V2   2
+
+typedef struct {
     float                    *samples;
     size_t                    num_frames;
     int                       channels;
     int                       sample_rate;
+    float                     gain;      /* linear multiplier, 1.0 = unity */
 
-    struct pw_thread_loop    *loop;
     struct pw_stream         *stream;
 
     atomic_int                pending;
     atomic_bool               playing;
     atomic_bool               reset;
     atomic_size_t             frame_pos;
+} audio_voice_t;
+
+static struct {
+    struct pw_thread_loop    *loop;      /* one thread loop drives both voices */
+    audio_voice_t             voice[AUDIO_NVOICES];
 } audio;
 
 typedef struct { char id[4]; uint32_t size; } wav_chunk;
@@ -119,7 +136,7 @@ typedef struct {
     uint16_t bps;
 } wav_fmt;
 
-static int wav_load(const char *path) {
+static int wav_load(const char *path, audio_voice_t *v) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         LOG_WARN("Cannot open WAV %s: %s", path, strerror(errno));
@@ -159,57 +176,57 @@ static int wav_load(const char *path) {
         return -1;
     }
 
-    audio.channels    = fmt.ch;
-    audio.sample_rate = (int)fmt.rate;
-    audio.num_frames  = ds / (fmt.bps / 8u) / fmt.ch;
-    audio.samples     = calloc(audio.num_frames * audio.channels, sizeof(float));
-    if (!audio.samples) { fclose(f); return -1; }
+    v->channels    = fmt.ch;
+    v->sample_rate = (int)fmt.rate;
+    v->num_frames  = ds / (fmt.bps / 8u) / fmt.ch;
+    v->samples     = calloc(v->num_frames * v->channels, sizeof(float));
+    if (!v->samples) { fclose(f); return -1; }
 
     {
         uint8_t *raw = malloc(ds);
         if (!raw || fread(raw, ds, 1, f) != 1) {
             free(raw); fclose(f);
-            free(audio.samples); audio.samples = NULL;
+            free(v->samples); v->samples = NULL;
             return -1;
         }
         fclose(f);
 
-        size_t total = audio.num_frames * audio.channels;
+        size_t total = v->num_frames * v->channels;
         switch (fmt.bps) {
             case 16:
             for (size_t i = 0; i < total; i++)
-                audio.samples[i] = ((int16_t *)raw)[i] / 32768.0f;
+                v->samples[i] = ((int16_t *)raw)[i] / 32768.0f;
             break;
             case 24:
             for (size_t i = 0; i < total; i++) {
                 int32_t s = (int32_t)(raw[i*3] | ((uint32_t)raw[i*3+1] << 8) |
                                      ((int32_t)((int8_t)raw[i*3+2]) << 16));
-                audio.samples[i] = s / 8388608.0f;
+                v->samples[i] = s / 8388608.0f;
             }
             break;
             case 32:
             for (size_t i = 0; i < total; i++)
-                audio.samples[i] = ((int32_t *)raw)[i] / 2147483648.0f;
+                v->samples[i] = ((int32_t *)raw)[i] / 2147483648.0f;
             break;
             default:
             free(raw);
-            free(audio.samples); audio.samples = NULL;
+            free(v->samples); v->samples = NULL;
             return -1;
         }
         free(raw);
     }
 
     LOG_INFO("Loaded %s: %zu frames, %d ch, %d Hz",
-             path, audio.num_frames, audio.channels, audio.sample_rate);
+             path, v->num_frames, v->channels, v->sample_rate);
     return 0;
 }
 
 static void on_process(void *userdata) {
-    (void)userdata;
+    audio_voice_t *v = userdata;
     struct pw_buffer *b;
     struct spa_buffer *buf;
 
-    if ((b = pw_stream_dequeue_buffer(audio.stream)) == NULL) {
+    if ((b = pw_stream_dequeue_buffer(v->stream)) == NULL) {
         pw_log_warn("out of buffers: %m");
         return;
     }
@@ -218,45 +235,53 @@ static void on_process(void *userdata) {
     float *dst = buf->datas[0].data;
     if (!dst) return;
 
-    int stride = (int)(sizeof(float) * audio.channels);
+    int stride = (int)(sizeof(float) * v->channels);
     int n_frames = buf->datas[0].maxsize / stride;
     if (b->requested)
         n_frames = SPA_MIN((int)b->requested, n_frames);
     size_t nf = (size_t)n_frames;
 
-    if (!atomic_load_explicit(&audio.playing, memory_order_acquire) &&
-        atomic_load(&audio.pending) > 0) {
-        atomic_store_explicit(&audio.playing, true, memory_order_relaxed);
-        atomic_store(&audio.frame_pos, 0);
-        atomic_fetch_sub(&audio.pending, 1);
+    if (!atomic_load_explicit(&v->playing, memory_order_acquire) &&
+        atomic_load(&v->pending) > 0) {
+        atomic_store_explicit(&v->playing, true, memory_order_relaxed);
+        atomic_store(&v->frame_pos, 0);
+        atomic_fetch_sub(&v->pending, 1);
     }
 
-    if (atomic_load_explicit(&audio.playing, memory_order_acquire)) {
-        if (atomic_exchange(&audio.reset, false))
-            atomic_store(&audio.frame_pos, 0);
+    if (atomic_load_explicit(&v->playing, memory_order_acquire)) {
+        if (atomic_exchange(&v->reset, false))
+            atomic_store(&v->frame_pos, 0);
 
-        size_t pos = atomic_load(&audio.frame_pos);
-        size_t rem = audio.num_frames - pos;
+        size_t pos = atomic_load(&v->frame_pos);
+        size_t rem = v->num_frames - pos;
         size_t tc  = nf < rem ? nf : rem;
 
-        if (tc > 0)
-            memcpy(dst, audio.samples + pos * audio.channels, tc * (size_t)stride);
+        if (tc > 0) {
+            const float *src = v->samples + pos * v->channels;
+            size_t nsamp = tc * (size_t)v->channels;
+            float g = v->gain;
+            if (g == 1.0f)
+                memcpy(dst, src, nsamp * sizeof(float));
+            else
+                for (size_t i = 0; i < nsamp; i++)
+                    dst[i] = src[i] * g;
+        }
         if (nf > tc)
-            memset(dst + tc * audio.channels, 0, (nf - tc) * (size_t)stride);
+            memset(dst + tc * v->channels, 0, (nf - tc) * (size_t)stride);
 
         pos += tc;
-        if (pos >= audio.num_frames) {
-            atomic_store(&audio.playing, false);
-            atomic_store(&audio.frame_pos, 0);
-            if (atomic_load(&audio.pending) > 0) {
-                atomic_store(&audio.playing, true);
-                atomic_store(&audio.frame_pos, 0);
-                atomic_fetch_sub(&audio.pending, 1);
+        if (pos >= v->num_frames) {
+            atomic_store(&v->playing, false);
+            atomic_store(&v->frame_pos, 0);
+            if (atomic_load(&v->pending) > 0) {
+                atomic_store(&v->playing, true);
+                atomic_store(&v->frame_pos, 0);
+                atomic_fetch_sub(&v->pending, 1);
             }
-        } else if (atomic_exchange(&audio.reset, false)) {
-            atomic_store(&audio.frame_pos, 0);
+        } else if (atomic_exchange(&v->reset, false)) {
+            atomic_store(&v->frame_pos, 0);
         } else {
-            atomic_store(&audio.frame_pos, pos);
+            atomic_store(&v->frame_pos, pos);
         }
     } else {
         memset(dst, 0, nf * (size_t)stride);
@@ -266,7 +291,7 @@ static void on_process(void *userdata) {
     buf->datas[0].chunk->stride = stride;
     buf->datas[0].chunk->size   = nf * (size_t)stride;
 
-    pw_stream_queue_buffer(audio.stream, b);
+    pw_stream_queue_buffer(v->stream, b);
 }
 
 static const struct pw_stream_events stream_events = {
@@ -275,46 +300,71 @@ static const struct pw_stream_events stream_events = {
 };
 
 static int audio_init(void) {
-    const struct spa_pod *params[1];
-    uint8_t podbuf[1024];
-    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(podbuf, sizeof(podbuf));
-
     pw_init(NULL, NULL);
 
     audio.loop = pw_thread_loop_new("doubletap-audio", NULL);
     if (!audio.loop) { pw_deinit(); return -1; }
 
     pw_thread_loop_lock(audio.loop);
-
     struct pw_loop *pl = pw_thread_loop_get_loop(audio.loop);
-    struct pw_properties *props = pw_properties_new(
-        PW_KEY_MEDIA_TYPE,     "Audio",
-        PW_KEY_MEDIA_CATEGORY, "Playback",
-        PW_KEY_MEDIA_ROLE,     "Game",
-        NULL);
 
-    audio.stream = pw_stream_new_simple(pl, "doubletap", props,
-                                        &stream_events, NULL);
+    static const char *const voice_name[AUDIO_NVOICES] = {
+        "doubletap-v1", "doubletap-v2"
+    };
 
-    params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
-        &SPA_AUDIO_INFO_RAW_INIT(
-            .format   = SPA_AUDIO_FORMAT_F32,
-            .channels = audio.channels,
-            .rate     = audio.sample_rate));
+    int connected = 0;
+    for (int i = 0; i < AUDIO_NVOICES; i++) {
+        audio_voice_t *v = &audio.voice[i];
+        if (!v->samples) continue; /* voice with no sample: never plays */
 
-    pw_stream_connect(audio.stream,
-                      PW_DIRECTION_OUTPUT,
-                      PW_ID_ANY,
-                      PW_STREAM_FLAG_AUTOCONNECT |
-                      PW_STREAM_FLAG_MAP_BUFFERS  |
-                      PW_STREAM_FLAG_RT_PROCESS,
-                      params, 1);
+        uint8_t podbuf[1024];
+        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(podbuf, sizeof(podbuf));
+        const struct spa_pod *params[1];
+
+        struct pw_properties *props = pw_properties_new(
+            PW_KEY_MEDIA_TYPE,     "Audio",
+            PW_KEY_MEDIA_CATEGORY, "Playback",
+            PW_KEY_MEDIA_ROLE,     "Game",
+            NULL);
+
+        /* pass the voice as userdata so on_process knows which one it drives */
+        v->stream = pw_stream_new_simple(pl, voice_name[i], props,
+                                         &stream_events, v);
+        if (!v->stream) continue;
+
+        params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
+            &SPA_AUDIO_INFO_RAW_INIT(
+                .format   = SPA_AUDIO_FORMAT_F32,
+                .channels = v->channels,
+                .rate     = v->sample_rate));
+
+        pw_stream_connect(v->stream,
+                          PW_DIRECTION_OUTPUT,
+                          PW_ID_ANY,
+                          PW_STREAM_FLAG_AUTOCONNECT |
+                          PW_STREAM_FLAG_MAP_BUFFERS  |
+                          PW_STREAM_FLAG_RT_PROCESS,
+                          params, 1);
+        connected++;
+    }
 
     pw_thread_loop_unlock(audio.loop);
 
+    if (connected == 0) {
+        pw_thread_loop_destroy(audio.loop);
+        audio.loop = NULL;
+        pw_deinit();
+        return -1;
+    }
+
     if (pw_thread_loop_start(audio.loop) < 0) {
         pw_thread_loop_lock(audio.loop);
-        pw_stream_destroy(audio.stream);
+        for (int i = 0; i < AUDIO_NVOICES; i++) {
+            if (audio.voice[i].stream) {
+                pw_stream_destroy(audio.voice[i].stream);
+                audio.voice[i].stream = NULL;
+            }
+        }
         pw_thread_loop_unlock(audio.loop);
         pw_thread_loop_destroy(audio.loop);
         audio.loop = NULL;
@@ -325,12 +375,17 @@ static int audio_init(void) {
     return 0;
 }
 
-static void audio_trigger(void) {
+/* voice: 0 == V1, 1 == V2. Each stream restarts independently, so a V1
+ * click and a V2 click overlap rather than cutting each other off. */
+static void audio_trigger(int voice) {
     if (!audio_available) return;
-    if (atomic_load(&audio.playing))
-        atomic_store(&audio.reset, true);
+    if (voice < 0 || voice >= AUDIO_NVOICES) return;
+    audio_voice_t *v = &audio.voice[voice];
+    if (!v->stream) return; /* no sample loaded for this voice */
+    if (atomic_load(&v->playing))
+        atomic_store(&v->reset, true);
     else
-        atomic_fetch_add(&audio.pending, 1);
+        atomic_fetch_add(&v->pending, 1);
 }
 
 static void audio_cleanup(void) {
@@ -338,17 +393,21 @@ static void audio_cleanup(void) {
     if (audio.loop) {
         pw_thread_loop_stop(audio.loop);
         pw_thread_loop_lock(audio.loop);
-        if (audio.stream) {
-            pw_stream_destroy(audio.stream);
-            audio.stream = NULL;
+        for (int i = 0; i < AUDIO_NVOICES; i++) {
+            if (audio.voice[i].stream) {
+                pw_stream_destroy(audio.voice[i].stream);
+                audio.voice[i].stream = NULL;
+            }
         }
         pw_thread_loop_unlock(audio.loop);
         pw_thread_loop_destroy(audio.loop);
         audio.loop = NULL;
     }
     pw_deinit();
-    free(audio.samples);
-    audio.samples = NULL;
+    for (int i = 0; i < AUDIO_NVOICES; i++) {
+        free(audio.voice[i].samples);
+        audio.voice[i].samples = NULL;
+    }
     audio_available = 0;
 }
 
@@ -370,7 +429,12 @@ typedef struct {
     int      k1, k2, v1, v2;
     int      socd;
     int      audio_enabled;
-    char    *wav_path;
+    char    *wav_path;      /* base sample; per-key fallback */
+    char    *wav_v1;        /* optional V1 override (NULL -> use wav_path) */
+    char    *wav_v2;        /* optional V2 override (NULL -> use wav_path) */
+    float    gain;          /* base gain; per-key fallback (default 1.0) */
+    float    gain_v1;       /* V1 gain override (<0 -> use gain) */
+    float    gain_v2;       /* V2 gain override (<0 -> use gain) */
     char    *uinput_name;
 } oid_config_t;
 
@@ -381,6 +445,9 @@ static void config_init(oid_config_t *c) {
     c->v1 = DEF_V1;
     c->v2 = DEF_V2;
     c->audio_enabled = 1;
+    c->gain    = 1.0f;
+    c->gain_v1 = -1.0f; /* sentinel: unset -> falls back to gain */
+    c->gain_v2 = -1.0f;
 }
 
 static void config_free(oid_config_t *c) {
@@ -389,6 +456,8 @@ static void config_free(oid_config_t *c) {
         free(c->device_paths[i]);
     free(c->device_paths);
     free(c->wav_path);
+    free(c->wav_v1);
+    free(c->wav_v2);
     free(c->uinput_name);
     memset(c, 0, sizeof(*c));
 }
@@ -429,6 +498,19 @@ static int parse_bool(yaml_node_t *n, int *out) {
     if (!strcasecmp(s, "false") || !strcasecmp(s, "no") ||
         !strcasecmp(s, "off")   || !strcmp(s, "0"))    { *out = 0; return 0; }
     return -1;
+}
+
+/* Parse a non-negative float (a linear gain). Rejects garbage and negatives. */
+static int parse_gain(yaml_node_t *n, float *out) {
+    if (!n || n->type != YAML_SCALAR_NODE) return -1;
+    const char *s = (const char *)n->data.scalar.value;
+    char *end = NULL;
+    errno = 0;
+    double d = strtod(s, &end);
+    if (end == s || *end != '\0' || errno != 0 || d < 0.0)
+        return -1;
+    *out = (float)d;
+    return 0;
 }
 
 /* Resolve a key code from a scalar - either a symbolic name ("KEY_Z") or
@@ -582,8 +664,35 @@ static int load_config(const char *path, oid_config_t *c) {
             LOG_ERR("'audio.wav' must be a scalar string");
             goto out;
         }
+        yaml_node_t *wav1 = map_get(&doc, aud, "wav_v1");
+        if (wav1 && scalar_dup(wav1, &c->wav_v1) != 0) {
+            LOG_ERR("'audio.wav_v1' must be a scalar string");
+            goto out;
+        }
+        yaml_node_t *wav2 = map_get(&doc, aud, "wav_v2");
+        if (wav2 && scalar_dup(wav2, &c->wav_v2) != 0) {
+            LOG_ERR("'audio.wav_v2' must be a scalar string");
+            goto out;
+        }
+        yaml_node_t *g = map_get(&doc, aud, "gain");
+        if (g && parse_gain(g, &c->gain) != 0) {
+            LOG_ERR("'audio.gain' must be a non-negative number");
+            goto out;
+        }
+        yaml_node_t *g1 = map_get(&doc, aud, "gain_v1");
+        if (g1 && parse_gain(g1, &c->gain_v1) != 0) {
+            LOG_ERR("'audio.gain_v1' must be a non-negative number");
+            goto out;
+        }
+        yaml_node_t *g2 = map_get(&doc, aud, "gain_v2");
+        if (g2 && parse_gain(g2, &c->gain_v2) != 0) {
+            LOG_ERR("'audio.gain_v2' must be a non-negative number");
+            goto out;
+        }
     }
-    if (c->audio_enabled && !c->wav_path) {
+    /* Base sample defaults only when no per-key override covers a voice.
+     * A voice with no wav (base or override) simply stays silent. */
+    if (c->audio_enabled && !c->wav_path && (!c->wav_v1 || !c->wav_v2)) {
         c->wav_path = strdup(DEF_WAV);
         if (!c->wav_path) { LOG_ERR("oom"); goto out; }
     }
@@ -958,7 +1067,9 @@ static int process_event(input_dev_t *in, const struct input_event *ie, const oi
     int is_k1 = (ie->code == (unsigned)cfg->k1);
 
     if (cfg->socd == SOCD_OFF) {
-        /* k1/k2 still tracked so release_stuck can clean up a dying device */
+        /* k1/k2 still tracked so release_stuck can clean up a dying device.
+         * Each key maps 1:1 to its own voice; both may sound if both are
+         * pressed (they play on independent streams). */
         if (ie->value != 2) {
             if (is_k1) in->k1 = ie->value;
             else       in->k2 = ie->value;
@@ -966,17 +1077,19 @@ static int process_event(input_dev_t *in, const struct input_event *ie, const oi
         libevdev_uinput_write_event(uidev, EV_KEY,
                                     is_k1 ? cfg->v1 : cfg->v2, ie->value);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-        return ie->value == 1;
+        if (ie->value != 1)
+            return VOICE_NONE;
+        return is_k1 ? VOICE_V1 : VOICE_V2;
     }
 
     if (ie->value == 2) /* autorepeat messes up state*/
-        return 0;
+        return VOICE_NONE;
 
     if (is_k1) in->k1 = ie->value;
     else       in->k2 = ie->value;
 
     int state = in->k1 + in->k2 + ie->value;
-    int triggered = 0;
+    int triggered = VOICE_NONE;
 
     switch (state) {
         case S_SINGLE:
@@ -986,7 +1099,7 @@ static int process_event(input_dev_t *in, const struct input_event *ie, const oi
         in->last_was_k1 = is_k1;
         libevdev_uinput_write_event(uidev, EV_KEY, code, 1);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-        triggered = 1;
+        triggered = is_k1 ? VOICE_V1 : VOICE_V2;
         break;
         case S_RELEASE:
         /* Snappy mode: releasing the non-active (already suppressed) key
@@ -1002,8 +1115,9 @@ static int process_event(input_dev_t *in, const struct input_event *ie, const oi
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
         libevdev_uinput_write_event(uidev, EV_KEY, down_code, 1);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+        /* down_code is the newly-pressed key: v2 when act was 1, else v1 */
+        triggered = in->act ? VOICE_V2 : VOICE_V1;
         in->act = !in->act;
-        triggered = 1;
         break;
         case S_NONE:
         up_code = in->act ? cfg->v1 : cfg->v2;
@@ -1052,8 +1166,11 @@ static int drain_device(input_dev_t *in, const oid_config_t *cfg) {
         /* Grab still deferred: the system receives these events directly
          * through the ungrabbed device, so mirroring or filtering them
          * would double them up - just let libevdev track the key state. */
-        if (in->grabbed && process_event(in, &ie, cfg))
-            audio_trigger();
+        if (in->grabbed) {
+            int voice = process_event(in, &ie, cfg);
+            if (voice != VOICE_NONE)
+                audio_trigger(voice - 1); /* VOICE_V1/V2 -> voice index 0/1 */
+        }
     }
 
     if (!in->grabbed && !any_key_down(in->dev)) {
@@ -1292,13 +1409,41 @@ main(int argc, char **argv) {
         LOG_INFO("Successfully acquired SCHED_FIFO real-time priority.");
     }
 
-    /* best-effort audio init  */
+    /* best-effort audio init: resolve per-voice sample + gain (per-key
+     * override falls back to the base wav/gain), load each present voice,
+     * then bring up the streams. Audio stays available if at least one
+     * voice loads. */
     if (cfg.audio_enabled) {
-        if (wav_load(cfg.wav_path) == 0 && audio_init() == 0) {
+        const char *wav_paths[AUDIO_NVOICES] = {
+            cfg.wav_v1 ? cfg.wav_v1 : cfg.wav_path,
+            cfg.wav_v2 ? cfg.wav_v2 : cfg.wav_path,
+        };
+        float gains[AUDIO_NVOICES] = {
+            cfg.gain_v1 >= 0.0f ? cfg.gain_v1 : cfg.gain,
+            cfg.gain_v2 >= 0.0f ? cfg.gain_v2 : cfg.gain,
+        };
+
+        int loaded = 0;
+        for (int i = 0; i < AUDIO_NVOICES; i++) {
+            if (!wav_paths[i]) continue; /* voice intentionally silent */
+            if (wav_load(wav_paths[i], &audio.voice[i]) == 0) {
+                audio.voice[i].gain = gains[i];
+                loaded++;
+            } else {
+                LOG_WARN("V%d hitsound load failed (%s); that key stays silent",
+                         i + 1, wav_paths[i]);
+            }
+        }
+
+        if (loaded > 0 && audio_init() == 0) {
             mlockall(MCL_CURRENT | MCL_FUTURE);
             audio_available = 1;
         } else {
             LOG_WARN("Audio disabled (WAV load or PipeWire init failed)");
+            for (int i = 0; i < AUDIO_NVOICES; i++) {
+                free(audio.voice[i].samples);
+                audio.voice[i].samples = NULL;
+            }
             audio_available = 0;
         }
     }
