@@ -457,6 +457,8 @@ typedef struct {
     int    rt_enabled;
     float  rt_press_mm;   /* downward reversal that re-presses */
     float  rt_release_mm; /* upward reversal that releases */
+    float  bottom_out_mm; /* within this of full travel == bottomed out, which
+                           * presses regardless of rt_press_mm; 0 disables */
     int    hid_k1;        /* HID usage override; -1 == derive from the keymap */
     int    hid_k2;
 } analog_config_t;
@@ -497,6 +499,7 @@ static void config_init(oid_config_t *c) {
     c->analog.rt_enabled    = 1;
     c->analog.rt_press_mm   = 0.3f;
     c->analog.rt_release_mm = 0.3f;
+    c->analog.bottom_out_mm = 0.1f;
     c->analog.hid_k1        = -1;   /* sentinel: derive from the keymap */
     c->analog.hid_k2        = -1;
 }
@@ -761,6 +764,12 @@ static int load_config(const char *path, oid_config_t *c) {
             yaml_node_t *pm = map_get(&doc, rt, "press_mm");
             if (pm && parse_gain(pm, &c->analog.rt_press_mm) != 0) {
                 LOG_ERR("'analog.rapid_trigger.press_mm' must be a "
+                        "non-negative number");
+                goto out;
+            }
+            yaml_node_t *bo = map_get(&doc, rt, "bottom_out_mm");
+            if (bo && parse_gain(bo, &c->analog.bottom_out_mm) != 0) {
+                LOG_ERR("'analog.rapid_trigger.bottom_out_mm' must be a "
                         "non-negative number");
                 goto out;
             }
@@ -1393,10 +1402,19 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
                 self->rt_extreme = depth_mm;
             }
         } else {
+            /* Bottoming out always presses, however small the down-travel
+             * since the last reversal - the mirror of rule 1, where a full
+             * release always releases however small the up-travel. Riding
+             * the backplate as the neutral position depends on this: with a
+             * large rt_press_mm, a wobble that ends against the bottom never
+             * travels far enough to satisfy the reversal test on its own. */
+            int bottomed = cfg->bottom_out_mm > 0.0f &&
+                           depth_mm >= cfg->travel_mm - cfg->bottom_out_mm;
             if (depth_mm < self->rt_extreme) {
                 self->rt_extreme = depth_mm;
             } else if (!gated &&
-                       depth_mm - self->rt_extreme >= cfg->rt_press_mm) {
+                       (bottomed ||
+                        depth_mm - self->rt_extreme >= cfg->rt_press_mm)) {
                 out[n++]         = 1;
                 self->live       = 1;
                 self->rt_extreme = depth_mm;
@@ -1563,6 +1581,7 @@ typedef struct {
     char           path[PATH_MAX];
     analog_state_t keys;
     socd_state_t   socd;
+    int            regime;         /* 1 == this overlap is SOCD-managed */
     unsigned       suppressed[2];  /* running count, logged on shutdown */
 } analog_dev_t;
 
@@ -1825,9 +1844,9 @@ enum { S_NONE = 0, S_RELEASE = 1, S_SINGLE = 2, S_PRESS = 3 };
  * process_event() below feeds it real key events, analog_drive() feeds it
  * edges derived from travel depth. The transition logic is identical either
  * way, which is the point. */
-static int socd_apply(socd_state_t *in, int is_k1, int value,
+static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
                       const oid_config_t *cfg) {
-    if (cfg->socd == SOCD_OFF) {
+    if (mode == SOCD_OFF) {
         /* k1/k2 still tracked so release_stuck can clean up a dying device.
          * Each key maps 1:1 to its own voice; both may sound if both are
          * pressed (they play on independent streams). */
@@ -1865,7 +1884,7 @@ static int socd_apply(socd_state_t *in, int is_k1, int value,
         /* Snappy mode: releasing the non-active (already suppressed) key
          * changes nothing; only the active key's release falls through to
          * the still-held one. Toggle mode reverts on either release. */
-        if (cfg->socd == SOCD_SNAPPY && is_k1 != in->act)
+        if (mode == SOCD_SNAPPY && is_k1 != in->act)
             break;
         /* fallthrough */
         case S_PRESS:
@@ -1911,7 +1930,8 @@ static int process_event(input_dev_t *in, const struct input_event *ie,
     if (in->analog)
         return VOICE_NONE;
 
-    return socd_apply(&in->socd, ie->code == (unsigned)cfg->k1, ie->value, cfg);
+    return socd_apply(&in->socd, ie->code == (unsigned)cfg->k1, ie->value,
+                      cfg->socd, cfg);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1959,6 +1979,40 @@ static int drain_device(input_dev_t *in, const oid_config_t *cfg) {
     return 0;
 }
 
+/* Route one synthesized edge into the SOCD core, deciding first whether
+ * this overlap is SOCD-managed at all.
+ *
+ * That choice is made once, when the second key goes down, and held for the
+ * rest of the overlap. Both keys deep means the player is riding the bottom
+ * and wants the toggle; anything shallower is ordinary alternate tapping,
+ * where the two keys must stay independent - running the toggle there turns
+ * an incidental overlap into an extra keypress, which is exactly the misfire
+ * this mode exists to remove.
+ *
+ * Latching at the second press rather than re-deciding per sample matters:
+ * switching regimes mid-overlap would desynchronize `act` from the virtual
+ * keys already emitted. On entry we seed `act` with the already-held key, so
+ * the core's S_PRESS releases the right one. */
+static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
+                            const oid_config_t *cfg) {
+    if (value == 1) {
+        int other_down = is_k1 ? ad->socd.k2 : ad->socd.k1;
+        if (other_down && !ad->regime &&
+            ad->keys.key[0].deep && ad->keys.key[1].deep) {
+            ad->regime   = 1;
+            ad->socd.act = !is_k1;   /* the held key is the active one */
+        }
+    }
+
+    int mode  = ad->regime ? cfg->socd : SOCD_OFF;
+    int voice = socd_apply(&ad->socd, is_k1, value, mode, cfg);
+
+    if (!ad->socd.k1 && !ad->socd.k2)
+        ad->regime = 0;              /* overlap over; re-decide next time */
+
+    return voice;
+}
+
 /* Read every queued analog report and turn travel depth into SOCD edges.
  * A key absent from a report is at rest, so each frame is a complete
  * picture rather than a delta: resolve the current depth of k1/k2, feed
@@ -1992,7 +2046,7 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
             int ne = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
                                      edges);
             for (int e = 0; e < ne; e++) {
-                int voice = socd_apply(&ad->socd, k == 0, edges[e], cfg);
+                int voice = analog_socd_edge(ad, k == 0, edges[e], cfg);
                 if (voice != VOICE_NONE)
                     audio_trigger(voice - 1);
             }

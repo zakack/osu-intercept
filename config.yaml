@@ -78,8 +78,16 @@ audio:
 # past actuation, and a fixed-threshold toggle cannot tell that from a
 # deliberate press. Each misfire costs two spurious notes.
 #
-# So a press has to earn the right to take over from the other key. How it
-# earns it is set by `gate`:
+# socd_depth_mm decides when the SOCD state machine engages at all. The two
+# keys interact through the toggle ONLY while both are riding deeper than
+# this; anything shallower is ordinary alternate tapping, where the keys stay
+# fully independent and an incidental overlap costs nothing. Set it deep -
+# around where you actually ride the keys when wobbling - so light tapping
+# never engages it. (The choice is made once, when the second key goes down,
+# and held until both are up.)
+#
+# Separately, a press has to earn the right to take over from the other key
+# while that key is held deep. How it earns it is set by `gate`:
 #
 #   relative (default) - deepest key wins. A press earns its way in by
 #       coming within gate_margin_mm of the other key's CURRENT depth.
@@ -114,13 +122,18 @@ audio:
 #   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
 #   actuation_mm: 1.0     # press threshold
 #   release_mm: 0.4       # full release; also clears the socd_depth latch
-#   socd_depth_mm: 1.5    # depth at which a press latches as "deep"
+#   socd_depth_mm: 3.0    # BOTH keys deeper than this -> SOCD engages
 #   gate: relative        # relative (deepest wins) | depth | off
 #   gate_margin_mm: 0.3   # relative: how close is close enough
 #   rapid_trigger:
 #     enabled: true
 #     press_mm: 0.3       # downward reversal that re-presses
 #     release_mm: 0.3     # upward reversal that releases
+#     bottom_out_mm: 0.1  # within this of full travel always presses, however
+#                         # small the down-travel - the mirror of a full
+#                         # release always releasing. Matters when press_mm is
+#                         # large and you ride the backplate as neutral.
+#                         # 0 disables.
 #   hid_k1: auto          # HID usage ids; derived from the keyboard's own
 #   hid_k2: auto          # keymap unless pinned here (see -A)
 

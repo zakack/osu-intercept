@@ -162,8 +162,16 @@ fixed-threshold SOCD cleaner:
 > spurious notes (the steal, then the revert on the way back up) and
 > inverting which key is active for everything after it.
 
-So a press has to earn the right to take over from the other key, and
-`analog.gate` decides how:
+`socd_depth_mm` decides **when the state machine engages at all**. The two
+keys interact through the toggle only while *both* are riding deeper than
+that; anything shallower is ordinary alternate tapping, where they stay
+independent and an incidental overlap costs nothing. Set it deep — around
+where you actually ride the keys — so light tapping never engages it. The
+choice is latched when the second key goes down and held until both are up,
+so the regime can't flip mid-roll.
+
+Separately, while one key *is* held deep, a press on the other has to earn
+the right to take over from it. `analog.gate` decides how:
 
 | mode | rule |
 | --- | --- |
@@ -182,6 +190,12 @@ an accidental dip are both shallow.
 
 The daemon logs every press it suppresses, with the depth it reached, so
 you can tell whether the gate is earning its keep or eating real input.
+
+Rapid trigger follows the same shape as Wootility's: `press_mm` and
+`release_mm` are reversal distances, and — as with a full release always
+releasing — **bottoming out always presses**, however small the down-travel
+(`bottom_out_mm`). That matters if you set a large `press_mm` and treat the
+backplate as your neutral position when wobbling.
 
 Once a press reaches `socd_depth_mm` it stays eligible until the key returns
 all the way up past `release_mm`, so easing off mid-roll does not demote it

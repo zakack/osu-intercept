@@ -183,8 +183,17 @@ down in reverse order.
 
 - `socd_apply` is the single SOCD core, shared by both input paths: the
   evdev path (`process_event`) feeds it real key events, the analog path
-  (`analog_drain`) feeds it edges synthesized from travel depth. Adding a
-  behavior to one path and not the other is almost always a bug.
+  (via `analog_socd_edge`) feeds it edges synthesized from travel depth.
+  Adding a behavior to one path and not the other is almost always a bug.
+  It takes the mode as an argument rather than reading `cfg->socd`, which is
+  what lets the analog path run a shallow overlap as a plain remap.
+- `analog_socd_edge` decides whether an overlap is SOCD-managed at all: only
+  when BOTH keys are `deep`. Gating the *emission* of a press is not enough
+  — two shallow presses that both reach `socd_apply` still trigger the
+  toggle, which turns an incidental overlap during alternate tapping into an
+  extra keypress. The decision is latched at the second press and held until
+  both keys are up; re-deciding mid-overlap would desynchronize `act` from
+  the virtual keys already emitted.
 - In analog mode the digital k1/k2 of the analog keyboard MUST be dropped
   (`in->analog`, set by matching vendor/product in `input_try_open`), or
   every press is emitted twice — once from evdev and once from analog.
