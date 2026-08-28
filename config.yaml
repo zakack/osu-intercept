@@ -121,7 +121,12 @@ audio:
 #   device: auto          # or an explicit /dev/hidrawN
 #   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
 #   actuation_mm: 1.0     # press threshold
-#   release_mm: 0.4       # full release; also clears the socd_depth latch
+#   release_mm: 0.4       # full release; also clears the socd_depth latch.
+#                         # Keep it above the firmware's reporting floor
+#                         # (~0.05mm on a 60HE+) and below actuation_mm: a
+#                         # key held right at the floor reports a constant
+#                         # small depth instead of vanishing, and at exactly
+#                         # release_mm it would never count as released.
 #   socd_depth_mm: 3.0    # BOTH keys deeper than this -> SOCD engages
 #   gate: relative        # relative (deepest wins) | depth | off
 #   gate_margin_mm: 0.3   # relative: how close is close enough
