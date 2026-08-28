@@ -11,14 +11,15 @@ them) — either an explicit config list or, by default, every
 keyboard-shaped device advertising both configured keys, with
 inotify-driven hotplug in both cases — applies a SOCD state machine to two
 configured physical keys — "toggle" (last-input + reverting toggle; "on"
-is a synonym), "snappy" (last input wins, no latching), or "off" (no
+is a synonym), "snappy" (last input wins, no latching), "analog" (toggle,
+but driven by travel depth read from an analog keyboard), or "off" (no
 cleaning, just the k1/k2 -> v1/v2 remap), selected by the top-level
 `socd` config field — and re-emits all input through a
 single uinput virtual keyboard. It also plays a click sound via PipeWire on
 every virtual keypress. Built for rhythm games (osu!) where fast key
 alternation needs a "rocking" input pattern instead of naive SOCD handling.
 
-The entire implementation lives in `doubletapd.c` (~980 lines) — there is
+The entire implementation lives in `doubletapd.c` (~1900 lines) — there is
 no multi-module structure.
 
 ## Build
@@ -54,16 +55,16 @@ falls back to the installed default (`/usr/share/doubletap/config.yaml`;
 CMake bakes the real prefix in via `DEF_CONFIG`/`DEF_WAV` compile
 definitions). See `config.yaml` for the schema: `devices` (optional list of
 `/dev/input/by-id/*` paths; omitted or `auto` means auto-discovery), `socd`
-(`toggle` default, `on` as a synonym, `snappy`, or `off`), `keys`
+(`toggle` default, `on` as a synonym, `snappy`, `analog`, or `off`), `keys`
 (k1/k2 physical -> v1/v2 virtual, symbolic `KEY_*` names or numeric codes),
 `audio` (enabled + wav path), `uinput`
-(virtual device name). After editing config, restart via
+(virtual device name), `analog` (analog-mode thresholds; see below). After
+editing config, restart via
 `systemctl --user restart doubletap`. The `-i DIR` flag overrides the
 scanned/watched device directory (default `/dev/input`) — mainly for
 integration testing against a directory of symlinks to synthetic uinput
-nodes.
-
-`packaging/arch/` holds an AUR-style `-git` PKGBUILD.
+nodes. The `-A` flag runs the analog monitor (live travel depth, no grab,
+no uinput device) for picking thresholds and discovering HID usage ids.
 
 ## Architecture
 
@@ -121,7 +122,29 @@ sections (search for the `/* --- */` banner comments):
    (autorepeat included), presses still return 1 for the audio trigger,
    and `k1`/`k2` are still tracked so `release_stuck` works.
 
-5. **Event loop** (`run_loop`/`drain_device`) — a single-threaded
+5. **Analog input** (`analog_*`, `hid_map_*`) — optional path used only by
+   `socd: analog`. Analog keyboards report per-key travel on a
+   vendor-defined HID interface (usage page `0xFF53` v2 / `0xFF54` v1); the
+   kernel makes no evdev node for a vendor usage page, so it exists purely
+   as `/dev/hidrawN` — a pollable fd that joins the same epoll set, and one
+   `EVIOCGRAB` has no bearing on. No vendor SDK and no kernel driver is
+   involved. `analog_open` finds the node by matching the Wooting VID in
+   sysfs `uevent` then scanning `report_descriptor` for the vendor usage
+   page. `analog_decode` unpacks 16 slots per report. **A released key
+   vanishes from the report rather than reporting a final zero**, so rest is
+   inferred from absence — `analog_drain` rebuilds the full depth of k1/k2
+   each frame rather than tracking deltas. `analog_key_feed` is the per-key
+   front-end: it turns depth into press/release edges using `actuation_mm`
+   plus a gate deciding whether a press may take over from the other key —
+   `relative` (default; deepest key wins, within `gate_margin_mm`),
+   `depth` (must reach `socd_depth_mm`), or `off` — plus a software rapid
+   trigger. `relative` is the default because an accidental dip and a
+   deliberate light tap are both shallow, so an absolute threshold cannot
+   separate them; the other key's live depth can. k1/k2 -> HID usage
+   mapping is derived from the keyboard's own keymap via `EVIOCGKEYCODE_V2`
+   (hid-input stores the HID usage as the scancode), not a hardcoded table.
+
+6. **Event loop** (`run_loop`/`drain_device`) — a single-threaded
    `epoll`-based loop multiplexes all grabbed devices plus an inotify fd
    watching the input dir (and its `by-id`/`by-path` subdirs) with
    `IN_CREATE | IN_ATTRIB | IN_MOVED_TO`; `IN_ATTRIB` matters because a
@@ -135,7 +158,7 @@ sections (search for the `/* --- */` banner comments):
    keeps running with zero devices, waiting for hotplug (it only aborts at
    startup if nothing opened AND inotify is unavailable).
 
-6. **Audio** (`wav_load`, `audio_init`, `on_process`, `audio_trigger`) — a
+7. **Audio** (`wav_load`, `audio_init`, `on_process`, `audio_trigger`) — a
    hand-rolled WAV reader (16/24/32-bit PCM) loads the click sample into a
    float buffer up front. Playback runs on a dedicated PipeWire thread loop
    (`pw_thread_loop`); `on_process` is the realtime audio callback and only
@@ -148,14 +171,37 @@ sections (search for the `/* --- */` banner comments):
 `SCHED_FIFO` realtime priority (best-effort, warns and falls back on
 failure) -> best-effort audio init (`mlockall` if audio is enabled, to
 avoid page faults in the RT callback) -> build the virtual device (safe
-before any grab: discovery skips it via `is_doubletap_output`) -> install
+before any grab: discovery skips it via `is_doubletap_output`) -> open the
+analog interface if `socd: analog` (before the first reconcile, so grabbed
+keyboards already know their k1/k2 are analog-driven; a failure here just
+warns and falls back to `toggle`) -> install
 SIGINT/SIGTERM handlers -> run the event loop (which opens/grabs devices
 via the initial reconcile pass and handles hotplug thereafter) -> tear
 down in reverse order.
 
+## Key invariants to preserve when editing the state machine
+
+- `socd_apply` is the single SOCD core, shared by both input paths: the
+  evdev path (`process_event`) feeds it real key events, the analog path
+  (`analog_drain`) feeds it edges synthesized from travel depth. Adding a
+  behavior to one path and not the other is almost always a bug.
+- In analog mode the digital k1/k2 of the analog keyboard MUST be dropped
+  (`in->analog`, set by matching vendor/product in `input_try_open`), or
+  every press is emitted twice — once from evdev and once from analog.
+- `analog_key_feed` must keep `live` in sync with the edges it actually
+  emits; `socd_apply` assumes strict press/release alternation per key.
+- A `pending` analog press (one made while the other key was deep, that has
+  not yet cleared the gate) is promoted ONLY by clearing the gate on its own
+  merits, never by the other key ceasing to be deep — otherwise ending a tap
+  burst fires a trailing spurious note.
+- The gate applies to the rapid-trigger re-press as well as to fresh
+  actuation. Without that, a finger already resting past `actuation_mm`
+  before the other key went deep can still steal via a reversal.
+
 ## Key invariants to preserve when editing `process_event`
 
-- `k1`/`k2`/`act` state is per-input-device (`input_dev_t`), not global —
+- `k1`/`k2`/`act` state lives in a `socd_state_t` owned by each input
+  source (embedded in `input_dev_t`, and in `analog_dev_t`), not global —
   multiple physical keyboards are tracked independently even though they
   share one virtual output device.
 - Every emitted `EV_KEY` write must be followed by an `EV_SYN`/`SYN_REPORT`

@@ -16,7 +16,7 @@ re-pressed key.
 
 ## Features
 
-- **Three SOCD modes**, selected by the `socd` config field:
+- **Four SOCD modes**, selected by the `socd` config field:
   - `toggle` (default; `on` is a synonym) — *reverting toggle*: when both
     keys are held, the most recent press wins; releasing **either** key
     re-presses the other virtual key. Rocking your fingers between the two
@@ -24,6 +24,9 @@ re-pressed key.
   - `snappy` — *last input wins* ("Snappy Tappy"): the most recent press
     wins, but only releasing the **active** key falls back to the still-held
     one; releasing the already-suppressed key does nothing.
+  - `analog` — `toggle`, but driven by how far the keys are actually
+    pressed rather than by one fixed actuation point. Requires an analog
+    keyboard; see [Analog mode](#analog-mode).
   - `off` — no SOCD cleaning: k1/k2 are simply remapped to v1/v2, and the
     audio click still plays on each press.
 - **Kernel-level grab** — devices are grabbed exclusively via
@@ -116,7 +119,7 @@ schema. The short version:
 # devices:
 #   - /dev/input/by-id/usb-Your_Keyboard-event-kbd
 
-socd: toggle          # or "snappy" / "off" ("on" = "toggle")
+socd: toggle          # or "snappy" / "analog" / "off" ("on" = "toggle")
 
 keys:                 # physical k1/k2 -> virtual v1/v2
   k1: KEY_Z           # symbolic KEY_* names or numeric codes
@@ -135,6 +138,10 @@ audio:
 
 uinput:
   name: "doubletap virtual keyboard"
+
+# analog:             # only used by `socd: analog` — see below
+#   actuation_mm: 1.0
+#   socd_depth_mm: 1.5
 ```
 
 After editing, restart the daemon:
@@ -143,13 +150,81 @@ After editing, restart the daemon:
 systemctl --user restart doubletap
 ```
 
+## Analog mode
+
+Analog keyboards report *how far* each key is pressed, not just whether it
+is down. `socd: analog` uses that to fix a specific failure of every
+fixed-threshold SOCD cleaner:
+
+> While single-tapping one key at speed, the finger resting on the other key
+> dips a fraction of a millimetre past actuation. A fixed threshold cannot
+> tell that from a deliberate press, so the toggle fires — costing two
+> spurious notes (the steal, then the revert on the way back up) and
+> inverting which key is active for everything after it.
+
+So a press has to earn the right to take over from the other key, and
+`analog.gate` decides how:
+
+| mode | rule |
+| --- | --- |
+| `relative` (default) | **deepest key wins** — earn it by coming within `gate_margin_mm` of the other key's *current* depth |
+| `depth` | fixed threshold — reach `socd_depth_mm` or emit nothing |
+| `off` | no gating; plain analog toggle plus rapid trigger |
+
+`relative` is the default because it discriminates on the right thing.
+During real alternation the rising key crosses the falling one naturally,
+so it fires exactly when the roll happens and scales with however hard you
+play. An accidental dip — or a keycap magnet bouncing from the shock of a
+hard hit on the *other* key, which is a real effect on Hall-effect boards —
+sits millimetres above a bottomed-out key and never comes close. A fixed
+threshold cannot make that distinction, because a deliberate light tap and
+an accidental dip are both shallow.
+
+The daemon logs every press it suppresses, with the depth it reached, so
+you can tell whether the gate is earning its keep or eating real input.
+
+Once a press reaches `socd_depth_mm` it stays eligible until the key returns
+all the way up past `release_mm`, so easing off mid-roll does not demote it
+— the same idea as Wootility's *Continuous Rapid Trigger*. A software rapid
+trigger comes along for the ride, since the daemon is computing actuation
+itself either way.
+
+### Picking thresholds
+
+Run the analog monitor and watch your own travel depth:
+
+```sh
+doubletapd -A
+```
+
+It prints live depth per key and the peak depth of each press, grabs
+nothing, and creates no virtual device — safe to run alongside a live
+daemon. Set `socd_depth_mm` comfortably below how deep you actually ride
+the keys and comfortably above an accidental dip.
+
+### Requirements and caveats
+
+- A Wooting keyboard (the analog interface is read directly from
+  `/dev/hidraw*`; no vendor SDK or kernel driver is involved). Other analog
+  boards are not supported yet.
+- Read access to the analog hidraw node. The `70-wooting.rules` udev rules
+  shipped with Wootility grant this via `uaccess`, which covers a graphical
+  session; outside one, add a group-based rule.
+- **Turn off the keyboard's own rapid trigger and SOCD** (Snappy Tappy /
+  Rappy Snappy). The daemon does both itself, and on-board versions fight
+  it.
+- If no analog device is found, the daemon logs a warning and falls back to
+  the digital `toggle` behaviour rather than failing.
+
 ## Running manually
 
 ```
-usage: doubletapd [-h] [-c CONFIG] [-i DIR]
+usage: doubletapd [-h] [-A] [-c CONFIG] [-i DIR]
 
 options:
     -h          show this help and exit
+    -A          analog monitor: print live key travel depth and exit
+                (for picking thresholds; grabs nothing)
     -c CONFIG   path to YAML config
     -i DIR      directory to scan/watch for event devices
                 (default /dev/input; mainly for testing)
@@ -173,7 +248,10 @@ Handy for trying config changes before restarting the service:
    Releasing a key while the other is still held re-presses the other
    virtual key (in `toggle` mode; `snappy` only does this when the active
    key was released). In `off` mode the state machine is bypassed entirely
-   and k1/k2 are remapped one-to-one to v1/v2.
+   and k1/k2 are remapped one-to-one to v1/v2. In `analog` mode the digital
+   k1/k2 events are dropped and the same state machine is driven instead by
+   press/release edges synthesized from travel depth, read from the
+   keyboard's analog hidraw interface on the same epoll loop.
 3. **Re-emit** — everything flows out through one uinput virtual keyboard
    with a full keyboard-wide key set, so hotplugged keyboards with unusual
    keys still work. Non-k1/k2 events are mirrored verbatim.

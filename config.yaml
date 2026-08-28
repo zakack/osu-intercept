@@ -34,6 +34,10 @@
 #            suppressed key does nothing.
 #   off    - no SOCD cleaning: k1/k2 are simply remapped to v1/v2
 #            (audio click still plays on each press).
+#   analog - toggle, but driven by how far the keys are actually pressed
+#            rather than by a single fixed actuation point. Requires an
+#            analog keyboard; see the `analog` section below. Falls back to
+#            `toggle` (with a warning) if no analog device is found.
 socd: toggle
 
 # Key mapping. Codes can be symbolic ("KEY_Z") or numeric (44).
@@ -65,6 +69,60 @@ audio:
   # wav_v2: /usr/share/doubletap/clack.wav
   # gain_v1: 1.0
   # gain_v2: 0.8
+
+# Analog mode (socd: analog). OPTIONAL - ignored by every other mode.
+#
+# Analog keyboards report how far each key is pressed, not just whether it
+# is down. That extra information solves a specific problem: while single-
+# tapping one key at speed, a finger resting on the other key can dip just
+# past actuation, and a fixed-threshold toggle cannot tell that from a
+# deliberate press. Each misfire costs two spurious notes.
+#
+# So a press has to earn the right to take over from the other key. How it
+# earns it is set by `gate`:
+#
+#   relative (default) - deepest key wins. A press earns its way in by
+#       coming within gate_margin_mm of the other key's CURRENT depth.
+#       During real alternation the rising key crosses the falling one
+#       naturally, so this fires exactly when the roll happens and scales
+#       with however hard you are playing. A resting finger's dip - or a
+#       keycap magnet bouncing from the shock of a hard hit on the other
+#       key - sits millimetres above a bottomed-out key and never comes
+#       close. This is what Wooting call "Rappy Snappy".
+#
+#   depth - fixed threshold: a press must reach socd_depth_mm or emit
+#       nothing at all. Easier to reason about, but it cannot tell an
+#       accidental dip from a deliberate light tap, since both are shallow;
+#       set it too high and real taps get swallowed.
+#
+#   off - no gating; plain analog toggle plus rapid trigger.
+#
+# Run `doubletapd -A` to watch live travel depth and pick numbers against
+# your own hands. The daemon also logs every press it suppresses, with the
+# depth it reached - a flood of those means the gate is too aggressive.
+#
+# Once a press reaches socd_depth_mm it stays eligible until the key comes
+# all the way back up past release_mm, so easing off mid-roll does not
+# demote it. This mirrors Wootility's "Continuous Rapid Trigger".
+#
+# Turn OFF the keyboard's own rapid trigger and SOCD (Snappy Tappy / Rappy
+# Snappy) in its configuration tool - the daemon does both itself here, and
+# on-board versions will fight it.
+#
+# analog:
+#   device: auto          # or an explicit /dev/hidrawN
+#   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
+#   actuation_mm: 1.0     # press threshold
+#   release_mm: 0.4       # full release; also clears the socd_depth latch
+#   socd_depth_mm: 1.5    # depth at which a press latches as "deep"
+#   gate: relative        # relative (deepest wins) | depth | off
+#   gate_margin_mm: 0.3   # relative: how close is close enough
+#   rapid_trigger:
+#     enabled: true
+#     press_mm: 0.3       # downward reversal that re-presses
+#     release_mm: 0.3     # upward reversal that releases
+#   hid_k1: auto          # HID usage ids; derived from the keyboard's own
+#   hid_k2: auto          # keymap unless pinned here (see -A)
 
 # Identification of the virtual uinput keyboard.
 uinput:
