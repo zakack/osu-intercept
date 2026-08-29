@@ -167,8 +167,11 @@ keys interact through the toggle only while *both* are riding deeper than
 that; anything shallower is ordinary alternate tapping, where they stay
 independent and an incidental overlap costs nothing. Set it deep — around
 where you actually ride the keys — so light tapping never engages it. The
-choice is latched when the second key goes down and held until both are up,
-so the regime can't flip mid-roll.
+choice is latched when the second key goes down and holds until one of the
+keys comes all the way back up. It deliberately does **not** track the
+emitted keys: rapid trigger lifts and re-presses them constantly, and a
+moment where both happen to be up is part of the rock, not the end of it —
+dropping the toggle there costs a beat and is audible.
 
 Separately, while one key *is* held deep, a press on the other has to earn
 the right to take over from it. `analog.gate` decides how:

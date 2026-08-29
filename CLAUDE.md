@@ -192,8 +192,14 @@ down in reverse order.
   — two shallow presses that both reach `socd_apply` still trigger the
   toggle, which turns an incidental overlap during alternate tapping into an
   extra keypress. The decision is latched at the second press and held until
-  both keys are up; re-deciding mid-overlap would desynchronize `act` from
-  the virtual keys already emitted.
+  a key fully releases (i.e. until `deep` clears); re-deciding mid-overlap
+  would desynchronize `act` from the virtual keys already emitted.
+- That latch keys off `deep`, NOT off `socd.k1`/`socd.k2`. Rapid trigger
+  lifts and re-presses the emitted keys constantly, so a moment where both
+  are up is mid-rock, not the end of the gesture — resetting the regime
+  there costs a beat to plain mode before the toggle re-engages. The reset
+  is checked after the edge is applied, so the release ending a wobble is
+  still reverted under the toggle.
 - In analog mode the digital k1/k2 of the analog keyboard MUST be dropped
   (`in->analog`, set by matching vendor/product in `input_try_open`), or
   every press is emitted twice — once from evdev and once from analog.

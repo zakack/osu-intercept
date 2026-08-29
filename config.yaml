@@ -83,8 +83,10 @@ audio:
 # this; anything shallower is ordinary alternate tapping, where the keys stay
 # fully independent and an incidental overlap costs nothing. Set it deep -
 # around where you actually ride the keys when wobbling - so light tapping
-# never engages it. (The choice is made once, when the second key goes down,
-# and held until both are up.)
+# never engages it. The choice is made once, when the second key goes down,
+# and holds until one of the keys comes all the way back up - rapid trigger
+# lifting both virtual keys mid-rock is part of the gesture, not the end of
+# it, so the toggle rides through it.
 #
 # Separately, a press has to earn the right to take over from the other key
 # while that key is held deep. How it earns it is set by `gate`:

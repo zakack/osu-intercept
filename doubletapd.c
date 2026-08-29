@@ -2007,8 +2007,17 @@ static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
     int mode  = ad->regime ? cfg->socd : SOCD_OFF;
     int voice = socd_apply(&ad->socd, is_k1, value, mode, cfg);
 
-    if (!ad->socd.k1 && !ad->socd.k2)
-        ad->regime = 0;              /* overlap over; re-decide next time */
+    /* The regime ends only when a key comes all the way back up, which is
+     * precisely what clears `deep`. It must NOT be tied to the emitted key
+     * state: rapid trigger releases and re-presses constantly, so a moment
+     * where both virtual keys happen to be up is just part of the rock, not
+     * the end of the gesture. Dropping the regime there costs a beat to
+     * plain mode before the toggle can re-engage, which is audible.
+     *
+     * Checked after the edge, not before, so the release that ends a wobble
+     * is still handled under the toggle and reverts correctly. */
+    if (!ad->keys.key[0].deep || !ad->keys.key[1].deep)
+        ad->regime = 0;
 
     return voice;
 }
