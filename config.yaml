@@ -78,15 +78,23 @@ audio:
 # past actuation, and a fixed-threshold toggle cannot tell that from a
 # deliberate press. Each misfire costs two spurious notes.
 #
-# socd_depth_mm decides when the SOCD state machine engages at all. The two
-# keys interact through the toggle ONLY while both are riding deeper than
-# this; anything shallower is ordinary alternate tapping, where the keys stay
-# fully independent and an incidental overlap costs nothing. Set it deep -
-# around where you actually ride the keys when wobbling - so light tapping
-# never engages it. The choice is made once, when the second key goes down,
-# and holds until one of the keys comes all the way back up - rapid trigger
-# lifting both virtual keys mid-rock is part of the gesture, not the end of
-# it, so the toggle rides through it.
+# socd_depth_mm decides when the SOCD state machine engages at all. When a
+# second key goes down while the key ALREADY HELD is riding deeper than
+# this, the toggle engages; otherwise the two keys stay fully independent
+# and an incidental overlap costs nothing, which is what you want for
+# ordinary alternate tapping. Set it around where you actually ride the keys
+# when wobbling, so light tapping never engages it.
+#
+# Only the held key's depth is tested, deliberately. The key going down has
+# barely travelled at the moment its press fires, so requiring depth of it
+# too would make engagement depend on exactly where a rapid-trigger re-press
+# happens to land - reliable only while socd_depth_mm stays well above that,
+# and erratic as it approaches.
+#
+# Once engaged the toggle holds until neither key is deep any more, i.e.
+# until the keys come back to the top. Rapid trigger lifting both virtual
+# keys mid-rock is part of the gesture, not the end of it, so it rides
+# straight through.
 #
 # Separately, a press has to earn the right to take over from the other key
 # while that key is held deep. How it earns it is set by `gate`:

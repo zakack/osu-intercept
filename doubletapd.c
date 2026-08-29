@@ -1996,9 +1996,19 @@ static int drain_device(input_dev_t *in, const oid_config_t *cfg) {
 static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
                             const oid_config_t *cfg) {
     if (value == 1) {
+        int other      = is_k1 ? 1 : 0;
         int other_down = is_k1 ? ad->socd.k2 : ad->socd.k1;
-        if (other_down && !ad->regime &&
-            ad->keys.key[0].deep && ad->keys.key[1].deep) {
+
+        /* Only the ALREADY-HELD key's depth is meaningful here. The key
+         * going down right now has barely travelled - its press edge fires
+         * at actuation, or at a rapid-trigger reversal - so it cannot yet
+         * be past socd_depth_mm, and demanding that it is makes engagement
+         * depend on how far a rapid-trigger re-press happens to land. That
+         * is stable only when socd_depth_mm sits above where re-presses
+         * fire, and turns into a coin flip as it approaches them. The held
+         * key being ridden deep is the actual signal that this is a wobble
+         * and not alternate tapping. */
+        if (other_down && !ad->regime && ad->keys.key[other].deep) {
             ad->regime   = 1;
             ad->socd.act = !is_k1;   /* the held key is the active one */
         }
@@ -2014,9 +2024,12 @@ static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
      * the end of the gesture. Dropping the regime there costs a beat to
      * plain mode before the toggle can re-engage, which is audible.
      *
-     * Checked after the edge, not before, so the release that ends a wobble
-     * is still handled under the toggle and reverts correctly. */
-    if (!ad->keys.key[0].deep || !ad->keys.key[1].deep)
+     * It lapses once NEITHER key is deep any more - if it required both,
+     * a wobble whose second key never crossed the threshold would drop the
+     * regime on the very next sample. Checked after the edge, not before,
+     * so the release that ends a wobble is still handled under the toggle
+     * and reverts correctly. */
+    if (!ad->keys.key[0].deep && !ad->keys.key[1].deep)
         ad->regime = 0;
 
     return voice;

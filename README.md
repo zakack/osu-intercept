@@ -162,16 +162,21 @@ fixed-threshold SOCD cleaner:
 > spurious notes (the steal, then the revert on the way back up) and
 > inverting which key is active for everything after it.
 
-`socd_depth_mm` decides **when the state machine engages at all**. The two
-keys interact through the toggle only while *both* are riding deeper than
-that; anything shallower is ordinary alternate tapping, where they stay
-independent and an incidental overlap costs nothing. Set it deep — around
-where you actually ride the keys — so light tapping never engages it. The
-choice is latched when the second key goes down and holds until one of the
-keys comes all the way back up. It deliberately does **not** track the
-emitted keys: rapid trigger lifts and re-presses them constantly, and a
-moment where both happen to be up is part of the rock, not the end of it —
-dropping the toggle there costs a beat and is audible.
+`socd_depth_mm` decides **when the state machine engages at all**. When a
+second key goes down while the key *already held* is riding deeper than
+that, the toggle engages; otherwise the keys stay independent and an
+incidental overlap costs nothing — which is what you want for ordinary
+alternate tapping. Set it around where you actually ride the keys.
+
+Only the **held** key's depth is tested. The key going down has barely
+travelled when its press fires, so requiring depth of it too would tie
+engagement to wherever a rapid-trigger re-press happens to land: reliable
+while `socd_depth_mm` sits well above that, erratic as it approaches.
+
+Once engaged it holds until neither key is deep — until they come back to
+the top. It deliberately does **not** track the emitted keys, since rapid
+trigger lifts and re-presses those constantly and a moment where both are
+up is part of the rock, not the end of it.
 
 Separately, while one key *is* held deep, a press on the other has to earn
 the right to take over from it. `analog.gate` decides how:

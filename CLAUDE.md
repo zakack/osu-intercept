@@ -187,8 +187,11 @@ down in reverse order.
   Adding a behavior to one path and not the other is almost always a bug.
   It takes the mode as an argument rather than reading `cfg->socd`, which is
   what lets the analog path run a shallow overlap as a plain remap.
-- `analog_socd_edge` decides whether an overlap is SOCD-managed at all: only
-  when BOTH keys are `deep`. Gating the *emission* of a press is not enough
+- `analog_socd_edge` decides whether an overlap is SOCD-managed at all:
+  when the ALREADY-HELD key is `deep`. Testing the newly-pressed key too is
+  wrong — its press edge fires at actuation or at a rapid-trigger reversal,
+  before it has travelled, so engagement would hinge on where re-presses
+  happen to land relative to `socd_depth_mm`. Gating the *emission* of a press is not enough
   — two shallow presses that both reach `socd_apply` still trigger the
   toggle, which turns an incidental overlap during alternate tapping into an
   extra keypress. The decision is latched at the second press and held until
