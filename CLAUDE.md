@@ -19,7 +19,7 @@ single uinput virtual keyboard. It also plays a click sound via PipeWire on
 every virtual keypress. Built for rhythm games (osu!) where fast key
 alternation needs a "rocking" input pattern instead of naive SOCD handling.
 
-The entire implementation lives in `doubletapd.c` (~1900 lines) — there is
+The entire implementation lives in `doubletapd.c` (~2450 lines) — there is
 no multi-module structure.
 
 ## Build

@@ -1640,6 +1640,14 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
              (double)cfg->analog.actuation_mm, (double)cfg->analog.release_mm,
              (double)cfg->analog.socd_depth_mm,
              cfg->analog.rt_enabled ? "on" : "off");
+    if (cfg->analog.gate == ANALOG_GATE_DEPTH)
+        LOG_INFO("Analog gate: depth, %.2fmm",
+                 (double)cfg->analog.gate_depth_mm);
+    else if (cfg->analog.gate == ANALOG_GATE_RELATIVE)
+        LOG_INFO("Analog gate: relative, margin %.2fmm",
+                 (double)cfg->analog.gate_margin_mm);
+    else
+        LOG_INFO("Analog gate: off");
     return ad;
 }
 

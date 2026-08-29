@@ -142,7 +142,7 @@ audio:
 #                         # key held right at the floor reports a constant
 #                         # small depth instead of vanishing, and at exactly
 #                         # release_mm it would never count as released.
-#   socd_depth_mm: 3.0    # BOTH keys deeper than this -> SOCD engages
+#   socd_depth_mm: 3.0    # held key deeper than this -> SOCD engages
 #   gate: relative        # relative (deepest wins) | depth | off
 #   gate_margin_mm: 0.3   # relative: how close is close enough
 #   gate_depth_mm: 1.5    # depth: how deep a fresh press must go. Keep
