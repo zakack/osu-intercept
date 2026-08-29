@@ -573,6 +573,57 @@ static int parse_gain(yaml_node_t *n, float *out) {
     return 0;
 }
 
+/* Thresholds that are individually well-formed can still combine into a
+ * broken machine, and the failure modes are hard to attribute while playing:
+ * a key that self-oscillates at the report rate, or one whose deep latch can
+ * never clear. Reject those outright rather than let them reach the RT path.
+ * Only enforced for socd: analog - an unused analog block stays harmless. */
+static int analog_config_check(const analog_config_t *a) {
+    int bad = 0;
+
+    if (a->travel_mm <= 0.0f) {
+        LOG_ERR("'analog.travel_mm' must be greater than 0");
+        bad = 1;
+    }
+    if (a->release_mm <= 0.0f) {
+        LOG_ERR("'analog.release_mm' must be greater than 0, otherwise a key "
+                "can never register as fully released");
+        bad = 1;
+    }
+    if (a->actuation_mm <= a->release_mm) {
+        LOG_ERR("'analog.actuation_mm' (%.3f) must be greater than "
+                "'analog.release_mm' (%.3f)",
+                (double)a->actuation_mm, (double)a->release_mm);
+        bad = 1;
+    }
+    if (a->rt_enabled && a->rt_press_mm <= 0.0f) {
+        LOG_ERR("'analog.rapid_trigger.press_mm' must be greater than 0");
+        bad = 1;
+    }
+    if (a->rt_enabled && a->rt_release_mm <= 0.0f) {
+        LOG_ERR("'analog.rapid_trigger.release_mm' must be greater than 0, "
+                "otherwise a held key releases itself");
+        bad = 1;
+    }
+    if (bad)
+        return -1;
+
+    /* Survivable, but almost certainly not what was meant. */
+    if (a->bottom_out_mm >= a->travel_mm)
+        LOG_WARN("'analog.rapid_trigger.bottom_out_mm' (%.3f) >= travel_mm "
+                 "(%.3f): every sample counts as bottomed out",
+                 (double)a->bottom_out_mm, (double)a->travel_mm);
+    if (a->socd_depth_mm > a->travel_mm)
+        LOG_WARN("'analog.socd_depth_mm' (%.3f) exceeds travel_mm (%.3f): "
+                 "SOCD will never engage",
+                 (double)a->socd_depth_mm, (double)a->travel_mm);
+    if (a->gate == ANALOG_GATE_DEPTH && a->gate_depth_mm > a->travel_mm)
+        LOG_WARN("'analog.gate_depth_mm' (%.3f) exceeds travel_mm (%.3f): "
+                 "gated presses can never be promoted",
+                 (double)a->gate_depth_mm, (double)a->travel_mm);
+    return 0;
+}
+
 /* Resolve a key code from a scalar - either a symbolic name ("KEY_Z") or
  * a decimal/hex integer. Returns 0 on success. */
 static int parse_key_code(yaml_node_t *n, int *out) {
@@ -876,6 +927,9 @@ static int load_config(const char *path, oid_config_t *c) {
         if (!c->uinput_name) { LOG_ERR("oom"); goto out; }
     }
 
+    if (c->socd == SOCD_ANALOG && analog_config_check(&c->analog) != 0)
+        goto out;
+
     rc = 0;
 
 out:
@@ -902,6 +956,8 @@ typedef struct {
     int k1;   /* k1 down? */
     int k2;   /* k2 down? */
     int act;  /* 1 == v1 active, 0 == v2 (or none) */
+    int mode; /* mode of the last edge applied; release_stuck needs the
+               * EFFECTIVE mode, which for the analog path is not cfg->socd */
 } socd_state_t;
 
 typedef struct {
@@ -1418,11 +1474,15 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
              * the backplate as the neutral position depends on this: with a
              * large rt_press_mm, a wobble that ends against the bottom never
              * travels far enough to satisfy the reversal test on its own. */
+            /* A re-press still has to clear actuation_mm: without that
+             * floor, a reversal entirely within the top fraction of travel
+             * synthesizes whole keystrokes where the sensor is least
+             * linear. */
             int bottomed = cfg->bottom_out_mm > 0.0f &&
                            depth_mm >= cfg->travel_mm - cfg->bottom_out_mm;
             if (depth_mm < self->rt_extreme) {
                 self->rt_extreme = depth_mm;
-            } else if (!gated &&
+            } else if (!gated && depth_mm >= cfg->actuation_mm &&
                        (bottomed ||
                         depth_mm - self->rt_extreme >= cfg->rt_press_mm)) {
                 out[n++]         = 1;
@@ -1864,6 +1924,8 @@ enum { S_NONE = 0, S_RELEASE = 1, S_SINGLE = 2, S_PRESS = 3 };
  * way, which is the point. */
 static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
                       const oid_config_t *cfg) {
+    in->mode = mode;
+
     if (mode == SOCD_OFF) {
         /* k1/k2 still tracked so release_stuck can clean up a dying device.
          * Each key maps 1:1 to its own voice; both may sound if both are
@@ -1890,14 +1952,14 @@ static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
     int triggered = VOICE_NONE;
 
     switch (state) {
-        case S_SINGLE:
+        case S_SINGLE: {
         int code = is_k1 ? cfg->v1 : cfg->v2;
-        int up_code; int down_code;
         in->act = is_k1;
         libevdev_uinput_write_event(uidev, EV_KEY, code, 1);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
         triggered = is_k1 ? VOICE_V1 : VOICE_V2;
         break;
+        }
         case S_RELEASE:
         /* Snappy mode: releasing the non-active (already suppressed) key
          * changes nothing; only the active key's release falls through to
@@ -1905,9 +1967,9 @@ static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
         if (mode == SOCD_SNAPPY && is_k1 != in->act)
             break;
         /* fallthrough */
-        case S_PRESS:
-        up_code   = in->act ? cfg->v1 : cfg->v2;
-        down_code = in->act ? cfg->v2 : cfg->v1;
+        case S_PRESS: {
+        int up_code   = in->act ? cfg->v1 : cfg->v2;
+        int down_code = in->act ? cfg->v2 : cfg->v1;
         libevdev_uinput_write_event(uidev, EV_KEY, up_code, 0);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
         libevdev_uinput_write_event(uidev, EV_KEY, down_code, 1);
@@ -1916,12 +1978,14 @@ static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
         triggered = in->act ? VOICE_V2 : VOICE_V1;
         in->act = !in->act;
         break;
-        case S_NONE:
-        up_code = in->act ? cfg->v1 : cfg->v2;
+        }
+        case S_NONE: {
+        int up_code = in->act ? cfg->v1 : cfg->v2;
         libevdev_uinput_write_event(uidev, EV_KEY, up_code, 0);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
         in->act = 0;
         break;
+        }
         default:
         /* shouldn't make it here w/ sane inputs. */
         break;
@@ -2046,8 +2110,17 @@ static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
      * a wobble whose second key never crossed the threshold would drop the
      * regime on the very next sample. Checked after the edge, not before,
      * so the release that ends a wobble is still handled under the toggle
-     * and reverts correctly. */
-    if (!ad->keys.key[0].deep && !ad->keys.key[1].deep)
+     * and reverts correctly.
+     *
+     * It must ALSO wait until nothing is still held. Changing the effective
+     * mode while a virtual key is down strands it: the reverting toggle can
+     * legitimately leave `act` on a key whose finger has already lifted, and
+     * if the remaining release then routes through SOCD_OFF it writes only
+     * its own code, so whatever the toggle pressed is never released. Both
+     * physical keys being up is the one point where the two modes agree that
+     * nothing is emitted, so it is the only safe place to switch. */
+    if (!ad->keys.key[0].deep && !ad->keys.key[1].deep &&
+        !ad->socd.k1 && !ad->socd.k2)
         ad->regime = 0;
 
     return voice;
@@ -2080,6 +2153,15 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
             for (int k = 0; k < 2; k++)
                 if (s[i].code == ad->usage[k])
                     depth[k] = s[i].depth * cfg->analog.travel_mm;
+
+        /* Publish both depths before judging either key. The relative gate
+         * compares against the other key's depth, so feeding sequentially
+         * would judge k1 against the PREVIOUS report's k2 - about 0.2mm of
+         * error at speed, against a default margin of 0.3mm. That made
+         * mirrored gestures resolve differently depending on which key
+         * happened to be k1. */
+        ad->keys.key[0].depth = depth[0];
+        ad->keys.key[1].depth = depth[1];
 
         for (int k = 0; k < 2; k++) {
             int edges[2];
@@ -2120,7 +2202,7 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
 static void release_stuck(socd_state_t *in, const oid_config_t *cfg) {
     if (!(in->k1 || in->k2))
         return;
-    if (cfg->socd == SOCD_OFF) {
+    if (in->mode == SOCD_OFF) {
         /* no active-key tracking in off mode; both may be down */
         if (in->k1) {
             libevdev_uinput_write_event(uidev, EV_KEY, cfg->v1, 0);
