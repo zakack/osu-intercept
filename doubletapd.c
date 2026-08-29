@@ -454,6 +454,10 @@ typedef struct {
     float  socd_depth_mm; /* depth at which a press latches as "deep" */
     int    gate;          /* ANALOG_GATE_*: how a shallow press is judged */
     float  gate_margin_mm;/* relative gate: hysteresis against the other key */
+    float  gate_depth_mm; /* depth gate: how deep a fresh press must go.
+                           * Deliberately NOT socd_depth_mm - that wants to be
+                           * deep (where you ride the keys), this wants to be
+                           * shallow (just above an accidental dip). */
     int    rt_enabled;
     float  rt_press_mm;   /* downward reversal that re-presses */
     float  rt_release_mm; /* upward reversal that releases */
@@ -496,6 +500,7 @@ static void config_init(oid_config_t *c) {
     c->analog.socd_depth_mm = 1.5f;
     c->analog.gate          = ANALOG_GATE_RELATIVE;
     c->analog.gate_margin_mm = 0.3f;
+    c->analog.gate_depth_mm  = 1.5f;
     c->analog.rt_enabled    = 1;
     c->analog.rt_press_mm   = 0.3f;
     c->analog.rt_release_mm = 0.3f;
@@ -728,6 +733,7 @@ static int load_config(const char *path, oid_config_t *c) {
             { "release_mm",    offsetof(analog_config_t, release_mm)    },
             { "socd_depth_mm", offsetof(analog_config_t, socd_depth_mm) },
             { "gate_margin_mm", offsetof(analog_config_t, gate_margin_mm) },
+            { "gate_depth_mm",  offsetof(analog_config_t, gate_depth_mm)  },
         };
         for (size_t i = 0; i < sizeof(mm) / sizeof(mm[0]); i++) {
             yaml_node_t *v = map_get(&doc, an, mm[i].key);
@@ -1372,9 +1378,13 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
      * scales with however hard you are playing; a resting finger's dip,
      * millimetres above a key held at the bottom, never comes close.
      *
-     * DEPTH is the fixed-threshold version: reach socd_depth_mm or stay
+     * DEPTH is the fixed-threshold version: reach gate_depth_mm or stay
      * silent. Simpler to reason about, but it cannot tell a resting dip
-     * from a deliberate light tap, since both are shallow.
+     * from a deliberate light tap, since both are shallow - and set too
+     * deep it silently swallows real presses, because a press that never
+     * reaches it is never promoted at all. Note this is its OWN threshold,
+     * not socd_depth_mm: that one wants to sit where the keys are ridden,
+     * this one just above an accidental dip.
      *
      * Either way this gates the rapid-trigger re-press as well as fresh
      * actuation - otherwise a finger already resting past actuation_mm
@@ -1384,7 +1394,7 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
     int gated = 0;
     if (other->deep && !self->deep) {
         if (cfg->gate == ANALOG_GATE_DEPTH)
-            gated = depth_mm < cfg->socd_depth_mm;
+            gated = depth_mm < cfg->gate_depth_mm;
         else if (cfg->gate == ANALOG_GATE_RELATIVE)
             gated = depth_mm + cfg->gate_margin_mm < other->depth;
     }

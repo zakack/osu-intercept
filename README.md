@@ -184,7 +184,7 @@ the right to take over from it. `analog.gate` decides how:
 | mode | rule |
 | --- | --- |
 | `relative` (default) | **deepest key wins** — earn it by coming within `gate_margin_mm` of the other key's *current* depth |
-| `depth` | fixed threshold — reach `socd_depth_mm` or emit nothing |
+| `depth` | fixed threshold — reach `gate_depth_mm` or emit nothing |
 | `off` | no gating; plain analog toggle plus rapid trigger |
 
 `relative` is the default because it discriminates on the right thing.
@@ -198,6 +198,14 @@ an accidental dip are both shallow.
 
 The daemon logs every press it suppresses, with the depth it reached, so
 you can tell whether the gate is earning its keep or eating real input.
+
+Note what the gate does to a press it *doesn't* reject: it **withholds** it
+until the threshold is met. So every millimetre of `gate_depth_mm` is
+latency added to a re-press, and a wobble where some beats lift far enough
+to be re-gated and others don't will fire those beats at different times —
+an even finger rhythm coming out as a limp. Keep `gate_depth_mm` shallow,
+just above an accidental dip; it is a separate field from `socd_depth_mm`
+for exactly this reason, since that one wants to be deep.
 
 Rapid trigger follows the same shape as Wootility's: `press_mm` and
 `release_mm` are reversal distances, and — as with a full release always

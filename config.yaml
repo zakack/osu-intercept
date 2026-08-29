@@ -108,10 +108,15 @@ audio:
 #       key - sits millimetres above a bottomed-out key and never comes
 #       close. This is what Wooting call "Rappy Snappy".
 #
-#   depth - fixed threshold: a press must reach socd_depth_mm or emit
-#       nothing at all. Easier to reason about, but it cannot tell an
-#       accidental dip from a deliberate light tap, since both are shallow;
-#       set it too high and real taps get swallowed.
+#   depth - fixed threshold: a press must reach gate_depth_mm. Easier to
+#       reason about, but it cannot tell an accidental dip from a deliberate
+#       light tap, since both are shallow. Keep gate_depth_mm SHALLOW: the
+#       gate withholds a press until the threshold is met, so every extra
+#       millimetre is latency added to that press. Set deep, a re-press that
+#       eventually gets there still fires late, and a wobble where some
+#       beats lift far enough to re-gate and others don't turns into an
+#       uneven, limping rhythm. This is its own field precisely because
+#       socd_depth_mm wants the opposite (deep, where you ride the keys).
 #
 #   off - no gating; plain analog toggle plus rapid trigger.
 #
@@ -140,6 +145,8 @@ audio:
 #   socd_depth_mm: 3.0    # BOTH keys deeper than this -> SOCD engages
 #   gate: relative        # relative (deepest wins) | depth | off
 #   gate_margin_mm: 0.3   # relative: how close is close enough
+#   gate_depth_mm: 1.5    # depth: how deep a fresh press must go. Keep
+#                         # shallow - this is re-press latency.
 #   rapid_trigger:
 #     enabled: true
 #     press_mm: 0.3       # downward reversal that re-presses

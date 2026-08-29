@@ -208,6 +208,12 @@ down in reverse order.
   every press is emitted twice — once from evdev and once from analog.
 - `analog_key_feed` must keep `live` in sync with the edges it actually
   emits; `socd_apply` assumes strict press/release alternation per key.
+- The gate WITHHOLDS a press rather than merely rejecting it, so its
+  threshold is re-press latency. `gate_depth_mm` is deliberately separate
+  from `socd_depth_mm`: the gate wants a shallow value (just above an
+  accidental dip) while regime engagement wants a deep one (where the keys
+  are ridden). Reusing one number for both makes wobble beats fire at
+  inconsistent times.
 - A `pending` analog press (one made while the other key was deep, that has
   not yet cleared the gate) is promoted ONLY by clearing the gate on its own
   merits, never by the other key ceasing to be deep — otherwise ending a tap
