@@ -62,13 +62,16 @@ target_link_libraries(doubletapd PRIVATE
     ${LIBYAML_LIBRARIES}
 )
 
-# Developer tools, not installed. Each #includes doubletapd.c and stubs only
-# the uinput writes, so they exercise the daemon's own state machine rather
-# than a copy that could drift from it. Built on demand:
-#   cmake --build build --target replay      # replay a `doubletapd -T` trace
-#   cmake --build build --target regimetest  # assertions over the regime
+# Developer tools. Not installed, but deliberately part of the default build:
+# each #includes doubletapd.c so it exercises the daemon's own state machine
+# rather than a copy, and that guarantee is worthless if the binary can go
+# stale. EXCLUDE_FROM_ALL let `cmake --build build` skip them silently, which
+# produced a `replay` validating configs against rules the daemon no longer
+# had. A few seconds of build time is the cheaper mistake.
+#   ./build/replay TRACE.csv   replay a `doubletapd -T` recording
+#   ./build/regimetest         assertions over the regime
 foreach(tool replay regimetest)
-    add_executable(${tool} EXCLUDE_FROM_ALL tools/${tool}.c)
+    add_executable(${tool} tools/${tool}.c)
 
     target_compile_definitions(${tool} PRIVATE
         DEF_WAV="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/click.wav"
