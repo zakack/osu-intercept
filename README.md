@@ -183,18 +183,13 @@ the right to take over from it. `analog.gate` decides how:
 
 | mode | rule |
 | --- | --- |
-| `relative` (default) | **deepest key wins** — earn it by coming within `gate_margin_mm` of the other key's *current* depth |
-| `depth` | fixed threshold — reach `gate_depth_mm` or emit nothing |
+| `depth` (default) | reach `gate_depth_mm` or emit nothing |
 | `off` | no gating; plain analog toggle plus rapid trigger |
 
-`relative` is the default because it discriminates on the right thing.
-During real alternation the rising key crosses the falling one naturally,
-so it fires exactly when the roll happens and scales with however hard you
-play. An accidental dip — or a keycap magnet bouncing from the shock of a
-hard hit on the *other* key, which is a real effect on Hall-effect boards —
-sits millimetres above a bottomed-out key and never comes close. A fixed
-threshold cannot make that distinction, because a deliberate light tap and
-an accidental dip are both shallow.
+The threshold exists to stop an accidental dip — or a keycap magnet
+bouncing from the shock of a hard hit on the *other* key, which is a real
+effect on Hall-effect boards — from stealing the active key mid-wobble.
+Set it just above where those land and no higher.
 
 The daemon logs every press it suppresses, with the depth it reached, so
 you can tell whether the gate is earning its keep or eating real input.

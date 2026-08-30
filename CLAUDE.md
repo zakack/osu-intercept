@@ -136,11 +136,8 @@ sections (search for the `/* --- */` banner comments):
    each frame rather than tracking deltas. `analog_key_feed` is the per-key
    front-end: it turns depth into press/release edges using `actuation_mm`
    plus a gate deciding whether a press may take over from the other key —
-   `relative` (default; deepest key wins, within `gate_margin_mm`),
-   `depth` (must reach `socd_depth_mm`), or `off` — plus a software rapid
-   trigger. `relative` is the default because an accidental dip and a
-   deliberate light tap are both shallow, so an absolute threshold cannot
-   separate them; the other key's live depth can. k1/k2 -> HID usage
+   `depth` (default; must reach `gate_depth_mm`) or `off` — plus a software
+   rapid trigger. k1/k2 -> HID usage
    mapping is derived from the keyboard's own keymap via `EVIOCGKEYCODE_V2`
    (hid-input stores the HID usage as the scancode), not a hardcoded table.
 

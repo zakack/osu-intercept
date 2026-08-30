@@ -99,24 +99,14 @@ audio:
 # Separately, a press has to earn the right to take over from the other key
 # while that key is held deep. How it earns it is set by `gate`:
 #
-#   relative (default) - deepest key wins. A press earns its way in by
-#       coming within gate_margin_mm of the other key's CURRENT depth.
-#       During real alternation the rising key crosses the falling one
-#       naturally, so this fires exactly when the roll happens and scales
-#       with however hard you are playing. A resting finger's dip - or a
-#       keycap magnet bouncing from the shock of a hard hit on the other
-#       key - sits millimetres above a bottomed-out key and never comes
-#       close. This is what Wooting call "Rappy Snappy".
-#
-#   depth - fixed threshold: a press must reach gate_depth_mm. Easier to
-#       reason about, but it cannot tell an accidental dip from a deliberate
-#       light tap, since both are shallow. Keep gate_depth_mm SHALLOW: the
-#       gate withholds a press until the threshold is met, so every extra
-#       millimetre is latency added to that press. Set deep, a re-press that
-#       eventually gets there still fires late, and a wobble where some
-#       beats lift far enough to re-gate and others don't turns into an
-#       uneven, limping rhythm. This is its own field precisely because
-#       socd_depth_mm wants the opposite (deep, where you ride the keys).
+#   depth (default) - a press must reach gate_depth_mm. Keep gate_depth_mm
+#       SHALLOW: the gate withholds a press until the threshold is met, so
+#       every extra millimetre is latency added to that press. Set deep, a
+#       re-press that eventually gets there still fires late, and a wobble
+#       where some beats lift far enough to re-gate and others don't turns
+#       into an uneven, limping rhythm. This is its own field precisely
+#       because socd_depth_mm wants the opposite (deep, where you ride the
+#       keys).
 #
 #   off - no gating; plain analog toggle plus rapid trigger.
 #
@@ -143,8 +133,7 @@ audio:
 #                         # small depth instead of vanishing, and at exactly
 #                         # release_mm it would never count as released.
 #   socd_depth_mm: 3.0    # held key deeper than this -> SOCD engages
-#   gate: relative        # relative (deepest wins) | depth | off
-#   gate_margin_mm: 0.3   # relative: how close is close enough
+#   gate: depth           # depth | off
 #   gate_depth_mm: 1.5    # depth: how deep a fresh press must go. Keep
 #                         # shallow - this is re-press latency.
 #   rapid_trigger:
