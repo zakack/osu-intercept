@@ -191,8 +191,21 @@ down in reverse order.
   Adding a behavior to one path and not the other is almost always a bug.
   It takes the mode as an argument rather than reading `cfg->socd`, which is
   what lets the analog path run a shallow overlap as a plain remap.
-- The regime engages on a POSTURE: BOTH keys past `socd_depth_mm` at once,
-  and both `live`. One key deep while the other taps is deliberately left
+- The regime engages on a GESTURE, not a posture: both keys past
+  `socd_depth_mm` is only the precondition, and the trigger is BOTH keys
+  having produced a rapid-trigger edge since they went deep together. You
+  engage by rocking, not by pressing both keys down. This is forced — at the
+  instant the second key reaches the floor, "slider held on k1, next circle
+  tapped on k2" and "finger parked on k1, wobble about to start" are
+  observationally identical in depth, velocity and dwell. Nothing evaluated
+  then can separate them; the information only appears afterwards. It must
+  be BOTH keys, because a key that was already deep also emits on its way
+  out (the departing rapid-trigger release) and a player double-tapping k2
+  against a held slider re-presses it without fully lifting — both are one
+  finger moving against a parked one. `was_deep` gates which edges count, so
+  the arriving key's own press cannot qualify. The `rocked[2]` latches clear
+  whenever the precondition lapses.
+- Superseded: engaging on both keys deep and both `live`. One key deep while the other taps is deliberately left
   alone — the deep key is simply held while the other taps, which is a real
   thing to want. Engagement is resolved once per sample in
   `analog_regime_update`, called from `analog_drain` after both keys have

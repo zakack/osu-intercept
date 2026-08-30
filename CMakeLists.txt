@@ -62,42 +62,33 @@ target_link_libraries(doubletapd PRIVATE
     ${LIBYAML_LIBRARIES}
 )
 
-# Developer tool, not installed: replays a `doubletapd -T` trace through the
-# real analog state machine offline. It #includes doubletapd.c and stubs the
-# uinput writes, so it exercises the daemon's own code rather than a copy.
-# EXCLUDE_FROM_ALL - build it on demand with `--target replay`.
-add_executable(replay EXCLUDE_FROM_ALL tools/replay.c)
+# Developer tools, not installed. Each #includes doubletapd.c and stubs only
+# the uinput writes, so they exercise the daemon's own state machine rather
+# than a copy that could drift from it. Built on demand:
+#   cmake --build build --target replay      # replay a `doubletapd -T` trace
+#   cmake --build build --target regimetest  # assertions over the regime
+foreach(tool replay regimetest)
+    add_executable(${tool} EXCLUDE_FROM_ALL tools/${tool}.c)
 
-target_compile_definitions(replay PRIVATE
-    DEF_WAV="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/click.wav"
-    DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/config.yaml"
-)
-
-target_compile_options(replay PRIVATE
-    -Wall -Wextra
-    ${PIPEWIRE_CFLAGS_OTHER}
-    ${LIBEVDEV_CFLAGS_OTHER}
-    ${LIBYAML_CFLAGS_OTHER}
-)
-
-target_include_directories(replay PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${PIPEWIRE_INCLUDE_DIRS}
-    ${LIBEVDEV_INCLUDE_DIRS}
-    ${LIBYAML_INCLUDE_DIRS}
-)
-
-target_link_directories(replay PRIVATE
-    ${PIPEWIRE_LIBRARY_DIRS}
-    ${LIBEVDEV_LIBRARY_DIRS}
-    ${LIBYAML_LIBRARY_DIRS}
-)
-
-target_link_libraries(replay PRIVATE
-    ${PIPEWIRE_LIBRARIES}
-    ${LIBEVDEV_LIBRARIES}
-    ${LIBYAML_LIBRARIES}
-)
+    target_compile_definitions(${tool} PRIVATE
+        DEF_WAV="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/click.wav"
+        DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/config.yaml"
+    )
+    target_compile_options(${tool} PRIVATE
+        -Wall -Wextra
+        ${PIPEWIRE_CFLAGS_OTHER} ${LIBEVDEV_CFLAGS_OTHER} ${LIBYAML_CFLAGS_OTHER}
+    )
+    target_include_directories(${tool} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PIPEWIRE_INCLUDE_DIRS} ${LIBEVDEV_INCLUDE_DIRS} ${LIBYAML_INCLUDE_DIRS}
+    )
+    target_link_directories(${tool} PRIVATE
+        ${PIPEWIRE_LIBRARY_DIRS} ${LIBEVDEV_LIBRARY_DIRS} ${LIBYAML_LIBRARY_DIRS}
+    )
+    target_link_libraries(${tool} PRIVATE
+        ${PIPEWIRE_LIBRARIES} ${LIBEVDEV_LIBRARIES} ${LIBYAML_LIBRARIES}
+    )
+endforeach()
 
 configure_file(doubletap.service.in doubletap.service @ONLY)
 

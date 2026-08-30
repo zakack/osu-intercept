@@ -115,13 +115,15 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
         int   was = ad.regime;
         g_now_us = tr->f[i].us;
 
+        int was_deep[2] = { ad.keys.key[0].deep, ad.keys.key[1].deep };
         for (int k = 0; k < 2; k++)
             ne[k] = analog_key_feed(&ad.keys, k, tr->f[i].mm[k],
                                     &cfg->analog, edges[k]);
-        analog_regime_update(&ad, cfg);
+        analog_regime_pre(&ad, cfg);
         for (int k = 0; k < 2; k++)
             for (int e = 0; e < ne[k]; e++)
                 analog_socd_edge(&ad, k == 0, edges[k][e], cfg);
+        analog_regime_post(&ad, cfg, was_deep, ne);
 
         if (!was && ad.regime) {
             g_run.engagements++;

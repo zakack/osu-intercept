@@ -1669,6 +1669,9 @@ typedef struct {
     analog_state_t keys;
     socd_state_t   socd;
     int            regime;      /* 1 == this overlap is SOCD-managed */
+    int            rocked[2];   /* this key has moved since both went deep;
+                                 * both set == a wobble, see
+                                 * analog_regime_post */
     int            last_press;  /* 0 == k1, 1 == k2: most recent press edge.
                                  * Picks which key keeps its virtual on when
                                  * the regime engages with both already
@@ -2236,38 +2239,64 @@ static void analog_regime_set(analog_dev_t *ad, int on,
     }
 }
 
-/* Decide whether this is a wobble, once both keys have been fed.
+/* Decide whether the wobble is over, before this sample's edges are applied.
  *
- * Engagement is a POSTURE, not an event: both keys ridden past
- * socd_depth_mm at the same time. Until then one key deep and the other
- * tapping is left completely alone - the deep key is simply held while the
- * other taps, which is a real thing to want and not a misfire. That is the
- * opposite of testing the incoming key at its press edge, which cannot
- * work: the edge fires at actuation_mm, before the key has travelled, so it
- * is never deep at that instant. Here the second key joins on its own
- * schedule, on whatever sample it crosses the line, emitting nothing.
+ * The lapse tests `deep` alone. Rapid trigger lifts and re-presses the
+ * emitted keys constantly, so a moment where one is up is mid-rock, not the
+ * end of the gesture; only a finger actually leaving the switch ends it.
  *
- * Engaging also demands both keys be LIVE, which is what keeps fast
- * alternation out. Tapping k1 to the floor and off again leaves it latched
- * deep until it clears release_mm, so if k2 bottoms out in that window both
- * are deep - but k1's rapid-trigger release has already fired by then, so
- * it is not live and nothing engages. At the start of a deliberate wobble
- * both fingers are resting on the floor and both are live.
- *
- * Lapsing does NOT test live, deliberately. Rapid trigger lifts and
- * re-presses the emitted keys constantly, so a moment where one is up is
- * mid-rock, not the end of the gesture; only `deep` clearing - a finger
- * actually leaving the switch - ends it. The asymmetry is the point:
- * getting in takes commitment, staying in does not. */
-static void analog_regime_update(analog_dev_t *ad, const oid_config_t *cfg) {
-    int deep = ad->keys.key[0].deep && ad->keys.key[1].deep;
-
-    if (!ad->regime) {
-        if (deep && ad->keys.key[0].live && ad->keys.key[1].live)
-            analog_regime_set(ad, 1, cfg);
-    } else if (!deep) {
+ * Doing it before the edges is what stops the lift that ends a wobble from
+ * being reverted by a toggle on its way out: the release then lands as a
+ * plain release, over virtual keys the reconciliation has already put where
+ * SOCD_OFF expects them. */
+static void analog_regime_pre(analog_dev_t *ad, const oid_config_t *cfg) {
+    if (ad->regime && !(ad->keys.key[0].deep && ad->keys.key[1].deep))
         analog_regime_set(ad, 0, cfg);
+}
+
+/* Decide whether a wobble has STARTED, after this sample's edges.
+ *
+ * Both keys deep is only the precondition. The trigger is BOTH keys having
+ * produced a rapid-trigger edge since they went deep together - which is to
+ * say, you engage by rocking, not by pressing both keys down.
+ *
+ * That the trigger has to wait is forced. At the instant the second key
+ * arrives at the floor, "slider held on k1, next circle tapped on k2" and
+ * "finger resting on k1, wobble about to start" are observationally
+ * identical: same depths, same velocities, same dwell. Nothing evaluated at
+ * that moment can separate them, because the information does not exist
+ * yet. It appears afterwards, when one gesture starts rocking and the other
+ * does not.
+ *
+ * And it has to be BOTH keys, not just one. A key that was already deep
+ * produces an edge on its way out too - the departing rapid-trigger release
+ * of the circle that ended - and a player tapping two circles on k2 while
+ * holding a slider on k1 re-presses k2 without ever fully lifting it. Both
+ * of those are one finger moving against a parked one. Only a wobble has
+ * both keys moving while both are at the floor.
+ *
+ * `was_deep` gates which edges count: the arriving key's own press must not
+ * qualify, or the overlap engages on the very edge that created it.
+ *
+ * Checked after the edges so the triggering edge itself runs under
+ * SOCD_OFF. Engaging first would have the reconciliation release one of two
+ * held virtual keys to satisfy the toggle's one-key invariant, and the
+ * toggle's own revert would then press it straight back - a release and
+ * re-press of a key that should simply stay down, which osu! counts as an
+ * extra note. The cost is that a wobble opens at the plain-remap note rate
+ * and switches to the toggle's once both fingers have moved. */
+static void analog_regime_post(analog_dev_t *ad, const oid_config_t *cfg,
+                               const int *was_deep, const int *nedges) {
+    if (!(ad->keys.key[0].deep && ad->keys.key[1].deep)) {
+        ad->rocked[0] = ad->rocked[1] = 0;
+        return;
     }
+    for (int k = 0; k < 2; k++)
+        if (was_deep[k] && nedges[k] > 0)
+            ad->rocked[k] = 1;
+
+    if (!ad->regime && ad->rocked[0] && ad->rocked[1])
+        analog_regime_set(ad, 1, cfg);
 }
 
 /* Route one synthesized edge into the SOCD core under whatever regime is in
@@ -2318,12 +2347,13 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
          * release lands as a plain release, and the reconciliation in
          * analog_regime_set has already put the virtual keys where OFF
          * expects them. */
+        int was_deep[2] = { ad->keys.key[0].deep, ad->keys.key[1].deep };
         int edges[2][2], ne[2];
         for (int k = 0; k < 2; k++)
             ne[k] = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
                                     edges[k]);
 
-        analog_regime_update(ad, cfg);
+        analog_regime_pre(ad, cfg);
 
         for (int k = 0; k < 2; k++)
             for (int e = 0; e < ne[k]; e++) {
@@ -2331,6 +2361,8 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
                 if (voice != VOICE_NONE)
                     audio_trigger(voice - 1);
             }
+
+        analog_regime_post(ad, cfg, was_deep, ne);
     }
     return 0;
 }
