@@ -443,7 +443,16 @@ typedef struct {
     char  *device;        /* explicit /dev/hidrawN, NULL == auto-discover */
     float  travel_mm;     /* full key travel, for normalized -> mm */
     float  actuation_mm;  /* press threshold */
-    float  release_mm;    /* full-release threshold; clears the deep latch */
+    float  release_mm;    /* DERIVED, not configured: actuation_mm scaled by
+                           * ANALOG_RELEASE_RATIO. Hysteresis is not a taste
+                           * - it only has to be far enough below actuation
+                           * that a resting finger cannot straddle both, and
+                           * far enough above the firmware's reporting floor
+                           * that a key at rest still counts as released.
+                           * Scaling beats a fixed offset because actuation
+                           * ranges from 0.1mm to most of the travel, and a
+                           * subtraction that suits one end goes negative at
+                           * the other. */
     /* bottom_out_mm defines the backplate, and the backplate is the whole
      * gesture: bottoming both keys at once starts a wobble, and a key
      * counts as committed to one from the moment it bottoms until it comes
@@ -494,13 +503,12 @@ static void config_init(oid_config_t *c) {
     c->gain_v2 = -1.0f;
     c->analog.travel_mm     = 4.0f;
     c->analog.actuation_mm  = 1.0f;
-    c->analog.release_mm    = 0.4f;
     c->analog.rt_enabled    = 1;
     c->analog.rt_press_mm   = 0.3f;
     c->analog.rt_release_mm = 0.3f;
     c->analog.rt_deep_press_mm   = -1.0f;   /* unset: mirror rt_press_mm   */
     c->analog.rt_deep_release_mm = -1.0f;   /* unset: mirror rt_release_mm */
-    c->analog.bottom_out_mm = 0.1f;
+    c->analog.bottom_out_mm = 0.05f;
     c->analog.hid_k1        = -1;   /* sentinel: derive from the keymap */
     c->analog.hid_k2        = -1;
 }
@@ -589,7 +597,15 @@ static int parse_reversal(yaml_node_t *n, float *out) {
 
 /* Fill in the deep profile from the tapping profile wherever the config
  * left it unset, so everything downstream reads concrete numbers. */
+/* Hysteresis as a fraction of actuation, and the shallowest derived
+ * release worth trusting: a Wooting's firmware stops reporting a key a few
+ * hundredths of a millimetre from rest, and a release threshold underneath
+ * that would never fire. */
+#define ANALOG_RELEASE_RATIO 0.8f
+#define ANALOG_RELEASE_FLOOR 0.04f
+
 static void analog_config_resolve(analog_config_t *a) {
+    a->release_mm = a->actuation_mm * ANALOG_RELEASE_RATIO;
     if (a->rt_deep_press_mm < 0.0f)   a->rt_deep_press_mm   = a->rt_press_mm;
     if (a->rt_deep_release_mm < 0.0f) a->rt_deep_release_mm = a->rt_release_mm;
 }
@@ -606,15 +622,8 @@ static int analog_config_check(const analog_config_t *a) {
         LOG_ERR("'analog.travel_mm' must be greater than 0");
         bad = 1;
     }
-    if (a->release_mm <= 0.0f) {
-        LOG_ERR("'analog.release_mm' must be greater than 0, otherwise a key "
-                "can never register as fully released");
-        bad = 1;
-    }
-    if (a->actuation_mm <= a->release_mm) {
-        LOG_ERR("'analog.actuation_mm' (%.3f) must be greater than "
-                "'analog.release_mm' (%.3f)",
-                (double)a->actuation_mm, (double)a->release_mm);
+    if (a->actuation_mm <= 0.0f) {
+        LOG_ERR("'analog.actuation_mm' must be greater than 0");
         bad = 1;
     }
     if (a->rt_enabled && a->rt_press_mm <= 0.0f) {
@@ -640,6 +649,12 @@ static int analog_config_check(const analog_config_t *a) {
         return -1;
 
     /* Survivable, but almost certainly not what was meant. */
+    if (a->release_mm < ANALOG_RELEASE_FLOOR)
+        LOG_WARN("'analog.actuation_mm' (%.3f) puts the derived release at "
+                 "%.3fmm, under the ~%.2fmm the firmware stops reporting at: "
+                 "a resting key may never count as released",
+                 (double)a->actuation_mm, (double)a->release_mm,
+                 (double)ANALOG_RELEASE_FLOOR);
     if (a->bottom_out_mm >= a->travel_mm)
         LOG_WARN("'analog.rapid_trigger.bottom_out_mm' (%.3f) >= travel_mm "
                  "(%.3f): every sample counts as bottomed out",
@@ -804,7 +819,6 @@ static int load_config(const char *path, oid_config_t *c) {
         static const struct { const char *key; size_t off; } mm[] = {
             { "travel_mm",     offsetof(analog_config_t, travel_mm)     },
             { "actuation_mm",  offsetof(analog_config_t, actuation_mm)  },
-            { "release_mm",    offsetof(analog_config_t, release_mm)    },
         };
         for (size_t i = 0; i < sizeof(mm) / sizeof(mm[0]); i++) {
             yaml_node_t *v = map_get(&doc, an, mm[i].key);
@@ -818,10 +832,12 @@ static int load_config(const char *path, oid_config_t *c) {
         if (map_get(&doc, an, "gate") || map_get(&doc, an, "gate_depth_mm") ||
             map_get(&doc, an, "gate_margin_mm") ||
             map_get(&doc, an, "socd_depth_mm") ||
-            map_get(&doc, an, "engage"))
+            map_get(&doc, an, "engage") ||
+            map_get(&doc, an, "release_mm"))
             LOG_WARN("'analog.gate', 'gate_depth_mm', 'gate_margin_mm', "
-                     "'socd_depth_mm' and 'engage' were removed and are "
-                     "ignored - the backplate defines the gesture now");
+                     "'socd_depth_mm', 'engage' and 'release_mm' were "
+                     "removed and are ignored - the backplate defines the "
+                     "gesture, and release follows actuation");
 
         yaml_node_t *rt = map_get(&doc, an, "rapid_trigger");
         if (rt) {
@@ -1705,8 +1721,8 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
              "k2 -> hid 0x%02x", ad->path,
              ad->fmt == ANALOG_FMT_V2 ? "v2" : "v1", ad->vid, ad->pid,
              ad->usage[0], ad->usage[1]);
-    LOG_INFO("Analog thresholds: actuation %.2fmm, release %.2fmm, "
-             "backplate at %.2fmm, rapid trigger %s",
+    LOG_INFO("Analog thresholds: actuation %.2fmm, release %.2fmm "
+             "(derived), backplate at %.2fmm, rapid trigger %s",
              (double)cfg->analog.actuation_mm, (double)cfg->analog.release_mm,
              (double)(cfg->analog.travel_mm - cfg->analog.bottom_out_mm),
              cfg->analog.rt_enabled ? "on" : "off");

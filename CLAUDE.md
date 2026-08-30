@@ -279,6 +279,12 @@ down in reverse order.
 - The deep values are resolved from the tapping values in
   `analog_config_resolve` before any validation, so everything downstream
   reads concrete numbers and an unconfigured daemon runs one profile.
+- `release_mm` is DERIVED, never configured: `analog_config_resolve` sets
+  it to `actuation_mm * ANALOG_RELEASE_RATIO`. A fixed offset (Keychron's
+  `actn_pt - 3`) cannot work here because actuation ranges from 0.1mm to
+  most of the travel, and a subtraction suiting one end goes negative at
+  the other. A warning fires if the derived value lands under
+  `ANALOG_RELEASE_FLOOR`, where the firmware stops reporting at all.
 - `analog_key_feed` decides edges on `actuation_mm`/`release_mm` and the
   rapid trigger ALONE. It does not inspect the other key at all; the only
   cross-key decision in the analog path lives in `analog_socd_edge`. An

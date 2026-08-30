@@ -82,13 +82,13 @@ int main(void) {
     cfg.v2   = V2;
     cfg.analog.travel_mm     = 3.5f;
     cfg.analog.actuation_mm  = 0.10f;
-    cfg.analog.release_mm    = 0.08f;
     cfg.analog.rt_enabled    = 1;
     cfg.analog.rt_press_mm   = 0.08f;
     cfg.analog.rt_release_mm = 0.10f;
     cfg.analog.bottom_out_mm = 0.10f;      /* backplate at 3.40mm */
     cfg.analog.rt_deep_press_mm   = 0.0f;  /* riding: backplate only */
     cfg.analog.rt_deep_release_mm = 0.10f;
+    analog_config_resolve(&cfg.analog);    /* release_mm follows actuation */
 
     puts("A. planting both fingers starts it, immediately");
     fresh();

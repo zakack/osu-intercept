@@ -142,7 +142,7 @@ uinput:
 # analog:             # only used by `socd: analog` — see below
 #   actuation_mm: 1.0
 #   rapid_trigger:
-#     bottom_out_mm: 0.1
+#     bottom_out_mm: 0.05
 ```
 
 After editing, restart the daemon:

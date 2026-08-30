@@ -116,12 +116,6 @@ audio:
 #   device: auto          # or an explicit /dev/hidrawN
 #   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
 #   actuation_mm: 1.0     # press threshold
-#   release_mm: 0.4       # full release; also ends the wobble.
-#                         # Keep it above the firmware's reporting floor
-#                         # (~0.05mm on a 60HE+) and below actuation_mm: a
-#                         # key held right at the floor reports a constant
-#                         # small depth instead of vanishing, and at exactly
-#                         # release_mm it would never count as released.
 #   rapid_trigger:
 #     enabled: true
 #     press_mm: 0.3       # downward reversal that re-presses  } tapping
@@ -137,7 +131,7 @@ audio:
 #                         # wobble emits nothing, since the beats come from
 #                         # the release/re-press pair. Unset mirrors
 #                         # release_mm.
-#     bottom_out_mm: 0.1  # where the backplate starts. Bottoming out always
+#     bottom_out_mm: 0.05 # where the backplate starts. Bottoming out always
 #                         # presses however small the down-travel, AND
 #                         # bottoming BOTH keys at once is what starts a
 #                         # wobble. Must be greater than 0.
