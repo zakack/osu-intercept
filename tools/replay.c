@@ -119,7 +119,7 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
         for (int k = 0; k < 2; k++)
             ne[k] = analog_key_feed(&ad.keys, k, tr->f[i].mm[k],
                                     &cfg->analog, edges[k]);
-        analog_regime_pre(&ad, cfg);
+        analog_regime_pre(&ad, cfg, tr->f[i].mm);
         for (int k = 0; k < 2; k++)
             for (int e = 0; e < ne[k]; e++)
                 analog_socd_edge(&ad, k == 0, edges[k][e], cfg);

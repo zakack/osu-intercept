@@ -437,6 +437,12 @@ enum {
     SOCD_ANALOG = 3, /* toggle, but driven by travel depth (see analog_key_t) */
 };
 
+/* What arms the SOCD regime once both keys are deep. */
+enum {
+    ANALOG_ENGAGE_BOTTOM = 0, /* both keys against the backplate */
+    ANALOG_ENGAGE_ROCK   = 1, /* both keys have moved since going deep */
+};
+
 /* Analog mode tuning. Depths are millimetres of travel; see the banner in
  * the analog section for what each threshold gates. */
 typedef struct {
@@ -445,6 +451,7 @@ typedef struct {
     float  actuation_mm;  /* press threshold */
     float  release_mm;    /* full-release threshold; clears the deep latch */
     float  socd_depth_mm; /* depth at which a press latches as "deep" */
+    int    engage;        /* ANALOG_ENGAGE_*: what arms the regime */
     int    rt_enabled;
     float  rt_press_mm;   /* downward reversal that re-presses */
     float  rt_release_mm; /* upward reversal that releases */
@@ -630,6 +637,12 @@ static int analog_config_check(const analog_config_t *a) {
     }
     /* Nothing could ever re-press a key in the riding zone: travel is
      * switched off and there is no backplate rule to fall back on. */
+    if (a->engage == ANALOG_ENGAGE_BOTTOM && a->bottom_out_mm <= 0.0f) {
+        LOG_ERR("'analog.engage' is \"bottom\" but 'bottom_out_mm' is 0: "
+                "nothing would ever count as bottomed, so the regime could "
+                "never engage");
+        bad = 1;
+    }
     if (a->rt_enabled && a->rt_deep_press_mm == 0.0f &&
         a->bottom_out_mm <= 0.0f) {
         LOG_ERR("'analog.rapid_trigger.deep_press_mm' is off and "
@@ -823,6 +836,18 @@ static int load_config(const char *path, oid_config_t *c) {
                 goto out;
             }
         }
+        yaml_node_t *eg = map_get(&doc, an, "engage");
+        if (eg) {
+            const char *v = eg->type == YAML_SCALAR_NODE
+                            ? (const char *)eg->data.scalar.value : "";
+            if (!strcasecmp(v, "bottom"))     c->analog.engage = ANALOG_ENGAGE_BOTTOM;
+            else if (!strcasecmp(v, "rock")) c->analog.engage = ANALOG_ENGAGE_ROCK;
+            else {
+                LOG_ERR("'analog.engage' must be \"bottom\" or \"rock\"");
+                goto out;
+            }
+        }
+
         /* Removed along with the gate. Warn rather than fail: a stale key
          * in a config file should not stop the daemon starting. */
         if (map_get(&doc, an, "gate") || map_get(&doc, an, "gate_depth_mm") ||
@@ -1723,6 +1748,10 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
              (double)cfg->analog.actuation_mm, (double)cfg->analog.release_mm,
              (double)cfg->analog.socd_depth_mm,
              cfg->analog.rt_enabled ? "on" : "off");
+    LOG_INFO("SOCD engages on: %s",
+             cfg->analog.engage == ANALOG_ENGAGE_ROCK
+                 ? "both keys rocking while deep"
+                 : "both keys bottomed out");
     if (cfg->analog.rt_enabled) {
         char pb[16], rb[16];
         LOG_INFO("Rapid trigger: tapping press %.2fmm release %.2fmm | "
@@ -2249,9 +2278,35 @@ static void analog_regime_set(analog_dev_t *ad, int on,
  * being reverted by a toggle on its way out: the release then lands as a
  * plain release, over virtual keys the reconciliation has already put where
  * SOCD_OFF expects them. */
-static void analog_regime_pre(analog_dev_t *ad, const oid_config_t *cfg) {
-    if (ad->regime && !(ad->keys.key[0].deep && ad->keys.key[1].deep))
+static void analog_regime_pre(analog_dev_t *ad, const oid_config_t *cfg,
+                              const float *depth) {
+    if (ad->regime && !(ad->keys.key[0].deep && ad->keys.key[1].deep)) {
         analog_regime_set(ad, 0, cfg);
+        return;
+    }
+
+    /* BOTTOM: both keys against the backplate. Every wobble starts that
+     * way - you plant both fingers - so recall is total, and unlike a
+     * depth in the middle of travel it is a hard physical stop: you can
+     * hit it without proprioception and know you hit it, which also makes
+     * "don't bottom both at once" an instruction a player can follow.
+     *
+     * It does NOT separate a slider held on one key from a wobble starting
+     * on both; nothing evaluated in one instant can, since the two are the
+     * same observation. What it buys is a trigger you can aim, in exchange
+     * for a rule you have to respect. The alternative is ROCK below.
+     *
+     * Decided before this sample's edges so the arriving key's press runs
+     * under the toggle and takes over immediately - that is the whole
+     * point of an instantaneous trigger, and there is no churn to avoid:
+     * only one virtual key is down at this moment, since the press that
+     * completes the pair has not been applied yet. */
+    if (!ad->regime && cfg->analog.engage == ANALOG_ENGAGE_BOTTOM &&
+        ad->keys.key[0].deep && ad->keys.key[1].deep) {
+        float floor_mm = cfg->analog.travel_mm - cfg->analog.bottom_out_mm;
+        if (depth[0] >= floor_mm && depth[1] >= floor_mm)
+            analog_regime_set(ad, 1, cfg);
+    }
 }
 
 /* Decide whether a wobble has STARTED, after this sample's edges.
@@ -2287,6 +2342,8 @@ static void analog_regime_pre(analog_dev_t *ad, const oid_config_t *cfg) {
  * and switches to the toggle's once both fingers have moved. */
 static void analog_regime_post(analog_dev_t *ad, const oid_config_t *cfg,
                                const int *was_deep, const int *nedges) {
+    if (cfg->analog.engage != ANALOG_ENGAGE_ROCK)
+        return;
     if (!(ad->keys.key[0].deep && ad->keys.key[1].deep)) {
         ad->rocked[0] = ad->rocked[1] = 0;
         return;
@@ -2353,7 +2410,7 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
             ne[k] = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
                                     edges[k]);
 
-        analog_regime_pre(ad, cfg);
+        analog_regime_pre(ad, cfg, depth);
 
         for (int k = 0; k < 2; k++)
             for (int e = 0; e < ne[k]; e++) {

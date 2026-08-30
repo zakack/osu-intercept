@@ -191,9 +191,15 @@ down in reverse order.
   Adding a behavior to one path and not the other is almost always a bug.
   It takes the mode as an argument rather than reading `cfg->socd`, which is
   what lets the analog path run a shallow overlap as a plain remap.
-- The regime engages on a GESTURE, not a posture: both keys past
-  `socd_depth_mm` is only the precondition, and the trigger is BOTH keys
-  having produced a rapid-trigger edge since they went deep together. You
+- Both keys past `socd_depth_mm` is only the PRECONDITION; `analog.engage`
+  picks the trigger. `bottom` (default) fires when both keys are against
+  the backplate — decided in `analog_regime_pre`, before the sample's
+  edges, so the arriving key's press runs under the toggle and takes over
+  at once (no churn: only one virtual key is down at that moment, the
+  completing press not yet applied). `rock` fires when BOTH keys have
+  produced a rapid-trigger edge since going deep — decided in
+  `analog_regime_post`, after the edges, so the triggering edge lands under
+  SOCD_OFF. You
   engage by rocking, not by pressing both keys down. This is forced — at the
   instant the second key reaches the floor, "slider held on k1, next circle
   tapped on k2" and "finger parked on k1, wobble about to start" are

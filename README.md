@@ -178,22 +178,40 @@ the top. It deliberately does **not** track the emitted keys, since rapid
 trigger lifts and re-presses those constantly and a moment where both are
 up is part of the rock, not the end of it.
 
-The SOCD engine engages on a **posture**, not an event: both keys ridden
-past `socd_depth_mm` at the same time, both still pressed. Until that
-happens the two keys are completely independent, so:
+The SOCD engine only engages when both keys are past `socd_depth_mm` at the
+same time. Until then the two keys are completely independent, so:
 
 - **Both shallow** — ordinary alternate tapping, nothing to do with SOCD.
 - **One deep, one tapping** — the deep key is simply held while the other
   taps. A real thing to want, and no longer mistaken for a misfire.
 - **Both deep** — the wobble. The toggle takes over and the rocking begins.
 
-Getting in takes commitment; staying in does not. Engagement additionally
-requires both keys to be *emitting-pressed*, which keeps fast alternation
-out — a key tapped to the floor stays latched deep until it comes back up
-past `release_mm`, but its rapid-trigger release has already fired, so it
-is not live when the other key lands. The regime then rides through the
-constant lifting and re-pressing of a wobble, ending only when a finger
-actually leaves a switch.
+Both keys deep is only the *precondition*. What actually arms the regime is
+set by `analog.engage`:
+
+| mode | trigger |
+| --- | --- |
+| `bottom` (default) | both keys against the backplate |
+| `rock` | both keys have produced a rapid-trigger edge since going deep |
+
+**`bottom` is immediate and aimable.** Every wobble begins with both fingers
+planted on the backplate, so it never misses one, and unlike a depth in the
+middle of travel it is a hard physical stop — you can hit it without
+proprioception, and "don't bottom both keys at once" is an instruction a
+player can actually follow.
+
+**`rock` waits for the gesture**, which buys a real guarantee: a slider held
+on one key while the other is tapped can never engage it, because only one
+finger is moving. The cost is that a wobble opens at the plain note rate
+until both fingers have moved, and that a slow deliberate gesture can fail
+to arm if a finger leaves the switch between beats.
+
+Neither can separate a slider from a wobble *at the instant the second key
+lands* — at that moment the two are the same observation, and the
+information distinguishing them does not exist yet. `rock` waits for it;
+`bottom` trades it for a rule you respect instead. Once armed, the regime
+rides through the constant lifting and re-pressing of a wobble, ending only
+when a finger actually leaves a switch.
 
 Rapid trigger follows the same shape as Wootility's: `press_mm` and
 `release_mm` are reversal distances, and — as with a full release always

@@ -117,7 +117,16 @@ audio:
 #                         # key held right at the floor reports a constant
 #                         # small depth instead of vanishing, and at exactly
 #                         # release_mm it would never count as released.
-#   socd_depth_mm: 3.0    # held key deeper than this -> SOCD engages
+#   socd_depth_mm: 3.0    # both keys deeper than this -> SOCD may engage
+#   engage: bottom        # what actually arms it once both are deep:
+#                         #   bottom - both keys against the backplate.
+#                         #     Immediate, and every wobble starts this way.
+#                         #     Bottoming both during normal play arms it
+#                         #     too, which is a rule you can follow.
+#                         #   rock   - both keys have moved since going
+#                         #     deep. A slider held on one key while the
+#                         #     other is tapped can never arm it, at the
+#                         #     cost of a beat at the start of a wobble.
 #   rapid_trigger:
 #     enabled: true
 #     press_mm: 0.3       # downward reversal that re-presses  } tapping

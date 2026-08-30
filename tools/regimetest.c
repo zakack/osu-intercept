@@ -65,7 +65,7 @@ static void sample(float d0, float d1) {
 
     for (int k = 0; k < 2; k++)
         ne[k] = analog_key_feed(&ad.keys, k, d[k], &cfg.analog, edges[k]);
-    analog_regime_pre(&ad, &cfg);
+    analog_regime_pre(&ad, &cfg, d);
     for (int k = 0; k < 2; k++)
         for (int e = 0; e < ne[k]; e++)
             analog_socd_edge(&ad, k == 0, edges[k][e], &cfg);
@@ -94,6 +94,7 @@ int main(void) {
     cfg.analog.rt_deep_mm         = 3.3f;
     cfg.analog.rt_deep_press_mm   = 0.0f;  /* off: backplate only */
     cfg.analog.rt_deep_release_mm = 0.10f;
+    cfg.analog.engage = ANALOG_ENGAGE_ROCK;   /* A-E exercise the gesture */
 
     /* The case that motivated the rule: a slider held on k1 while the next
      * circle is tapped on k2. Both keys reach the floor, so "both deep"
@@ -167,6 +168,43 @@ int main(void) {
     sample(0.02f, 3.50f);
     expect_log("k1 leaves", "");
     expect_int("  still off", ad.regime, 0);
+
+    /* The default trigger. Every wobble starts with both fingers planted
+     * on the backplate, so recall is total and engagement is immediate -
+     * no waiting for a gesture to complete. The trade, asserted below so
+     * it stays deliberate: it cannot tell a slider from a wobble either,
+     * so bottoming BOTH keys at once during normal play does engage. That
+     * is a rule a player can follow, which "keep both keys above 3.3mm"
+     * is not. */
+    puts("F. engage: bottom - immediate, and its accepted trade");
+    cfg.analog.engage = ANALOG_ENGAGE_BOTTOM;
+
+    fresh();
+    sample(3.50f, 0.00f);
+    expect_log("k1 planted", "v1+");
+    expect_int("  regime off", ad.regime, 0);
+    sample(3.50f, 3.50f);
+    expect_log("k2 planted: engages at once, toggle steals", "v1- v2+");
+    expect_int("  regime on", ad.regime, 1);
+    sample(3.50f, 3.35f);
+    expect_log("rocking immediately, no warm-up", "v2- v1+");
+
+    /* Deep but NOT bottomed: stricter than the old both-deep rule. */
+    fresh();
+    sample(3.50f, 0.00f);
+    expect_log("k1 planted", "v1+");
+    sample(3.50f, 3.35f);
+    expect_log("k2 deep (3.35 >= 3.3) but not bottomed (< 3.42)", "v2+");
+    expect_int("  both deep, yet regime stays off", ad.regime, 0);
+    expect_int("  k2 is deep", ad.keys.key[1].deep, 1);
+
+    /* The accepted cost: a bottomed tap against a held slider. */
+    fresh();
+    sample(3.50f, 0.00f);
+    expect_log("slider held on k1", "v1+");
+    sample(3.50f, 3.50f);
+    expect_log("circle BOTTOMED on k2 - this does engage", "v1- v2+");
+    expect_int("  regime on (the known trade)", ad.regime, 1);
 
     printf("\n%s\n", fails ? "FAILURES ABOVE" : "all assertions passed");
     return fails ? 1 : 0;
