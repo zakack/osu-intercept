@@ -135,9 +135,7 @@ sections (search for the `/* --- */` banner comments):
    inferred from absence — `analog_drain` rebuilds the full depth of k1/k2
    each frame rather than tracking deltas. `analog_key_feed` is the per-key
    front-end: it turns depth into press/release edges using `actuation_mm`
-   plus a gate deciding whether a press may take over from the other key —
-   `depth` (default; must reach `gate_depth_mm`) or `off` — plus a software
-   rapid trigger. k1/k2 -> HID usage
+   plus a software rapid trigger. k1/k2 -> HID usage
    mapping is derived from the keyboard's own keymap via `EVIOCGKEYCODE_V2`
    (hid-input stores the HID usage as the scancode), not a hardcoded table.
 
@@ -205,19 +203,15 @@ down in reverse order.
   every press is emitted twice — once from evdev and once from analog.
 - `analog_key_feed` must keep `live` in sync with the edges it actually
   emits; `socd_apply` assumes strict press/release alternation per key.
-- The gate WITHHOLDS a press rather than merely rejecting it, so its
-  threshold is re-press latency. `gate_depth_mm` is deliberately separate
-  from `socd_depth_mm`: the gate wants a shallow value (just above an
-  accidental dip) while regime engagement wants a deep one (where the keys
-  are ridden). Reusing one number for both makes wobble beats fire at
-  inconsistent times.
-- A `pending` analog press (one made while the other key was deep, that has
-  not yet cleared the gate) is promoted ONLY by clearing the gate on its own
-  merits, never by the other key ceasing to be deep — otherwise ending a tap
-  burst fires a trailing spurious note.
-- The gate applies to the rapid-trigger re-press as well as to fresh
-  actuation. Without that, a finger already resting past `actuation_mm`
-  before the other key went deep can still steal via a reversal.
+- `analog_key_feed` decides edges on `actuation_mm`/`release_mm` and the
+  rapid trigger ALONE. It does not inspect the other key at all; the only
+  cross-key decision in the analog path lives in `analog_socd_edge`. An
+  earlier revision gated presses on the other key's depth to filter a
+  resting finger's dip — that filtered on depth, but a deliberate wobble and
+  an incidental overlap during alternate tapping are identical in depth, so
+  it could not separate them. Anything reaching for that problem again wants
+  direction or dwell, not a depth threshold, and belongs in
+  `analog_socd_edge` where the regime is decided.
 
 ## Key invariants to preserve when editing `process_event`
 

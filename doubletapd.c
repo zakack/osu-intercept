@@ -437,12 +437,6 @@ enum {
     SOCD_ANALOG = 3, /* toggle, but driven by travel depth (see analog_key_t) */
 };
 
-/* How a held-back press earns the right to take over from the other key. */
-enum {
-    ANALOG_GATE_DEPTH = 0, /* absolute: reach gate_depth_mm */
-    ANALOG_GATE_OFF   = 1, /* no gating; plain analog toggle */
-};
-
 /* Analog mode tuning. Depths are millimetres of travel; see the banner in
  * the analog section for what each threshold gates. */
 typedef struct {
@@ -451,11 +445,6 @@ typedef struct {
     float  actuation_mm;  /* press threshold */
     float  release_mm;    /* full-release threshold; clears the deep latch */
     float  socd_depth_mm; /* depth at which a press latches as "deep" */
-    int    gate;          /* ANALOG_GATE_*: how a shallow press is judged */
-    float  gate_depth_mm; /* depth gate: how deep a fresh press must go.
-                           * Deliberately NOT socd_depth_mm - that wants to be
-                           * deep (where you ride the keys), this wants to be
-                           * shallow (just above an accidental dip). */
     int    rt_enabled;
     float  rt_press_mm;   /* downward reversal that re-presses */
     float  rt_release_mm; /* upward reversal that releases */
@@ -496,8 +485,6 @@ static void config_init(oid_config_t *c) {
     c->analog.actuation_mm  = 1.0f;
     c->analog.release_mm    = 0.4f;
     c->analog.socd_depth_mm = 1.5f;
-    c->analog.gate          = ANALOG_GATE_DEPTH;
-    c->analog.gate_depth_mm  = 1.5f;
     c->analog.rt_enabled    = 1;
     c->analog.rt_press_mm   = 0.3f;
     c->analog.rt_release_mm = 0.3f;
@@ -614,10 +601,6 @@ static int analog_config_check(const analog_config_t *a) {
         LOG_WARN("'analog.socd_depth_mm' (%.3f) exceeds travel_mm (%.3f): "
                  "SOCD will never engage",
                  (double)a->socd_depth_mm, (double)a->travel_mm);
-    if (a->gate == ANALOG_GATE_DEPTH && a->gate_depth_mm > a->travel_mm)
-        LOG_WARN("'analog.gate_depth_mm' (%.3f) exceeds travel_mm (%.3f): "
-                 "gated presses can never be promoted",
-                 (double)a->gate_depth_mm, (double)a->travel_mm);
     return 0;
 }
 
@@ -780,7 +763,6 @@ static int load_config(const char *path, oid_config_t *c) {
             { "actuation_mm",  offsetof(analog_config_t, actuation_mm)  },
             { "release_mm",    offsetof(analog_config_t, release_mm)    },
             { "socd_depth_mm", offsetof(analog_config_t, socd_depth_mm) },
-            { "gate_depth_mm",  offsetof(analog_config_t, gate_depth_mm)  },
         };
         for (size_t i = 0; i < sizeof(mm) / sizeof(mm[0]); i++) {
             yaml_node_t *v = map_get(&doc, an, mm[i].key);
@@ -789,17 +771,13 @@ static int load_config(const char *path, oid_config_t *c) {
                 goto out;
             }
         }
-        yaml_node_t *gt = map_get(&doc, an, "gate");
-        if (gt) {
-            const char *s = gt->type == YAML_SCALAR_NODE
-                            ? (const char *)gt->data.scalar.value : "";
-            if (!strcasecmp(s, "depth"))    c->analog.gate = ANALOG_GATE_DEPTH;
-            else if (!strcasecmp(s, "off")) c->analog.gate = ANALOG_GATE_OFF;
-            else {
-                LOG_ERR("'analog.gate' must be \"depth\" or \"off\"");
-                goto out;
-            }
-        }
+        /* Removed along with the gate. Warn rather than fail: a stale key
+         * in a config file should not stop the daemon starting. */
+        if (map_get(&doc, an, "gate") || map_get(&doc, an, "gate_depth_mm") ||
+            map_get(&doc, an, "gate_margin_mm"))
+            LOG_WARN("'analog.gate', 'gate_depth_mm' and 'gate_margin_mm' "
+                     "were removed and are ignored - SOCD engagement now "
+                     "rests on socd_depth_mm alone");
 
         yaml_node_t *rt = map_get(&doc, an, "rapid_trigger");
         if (rt) {
@@ -1322,19 +1300,15 @@ static int analog_decode(int fmt, const unsigned char *buf, size_t len,
 /*
  * Analog front-end for one physical key: turns a stream of travel-depth
  * samples (mm) into the same press/release edges the digital evdev path
- * feeds the SOCD core, plus the one thing the digital path structurally
- * cannot do - withhold a press until it is deep enough to trust.
+ * feeds the SOCD core.
  *
- * Two thresholds instead of one is the whole feature. actuation_mm means
- * "this is a keypress"; socd_depth_mm means "this is a keypress deep
- * enough to be allowed to fight the other key for SOCD ownership". A key
- * that actuates while the other key is already past socd_depth_mm
- * ("deep") is held in `pending`: it emits nothing and takes no part until
- * either it reaches socd_depth_mm itself (promoted - the deliberate rock
- * the player intended) or it returns to rest without ever getting there
- * (a resting finger's dip, which must leave no trace at all, because a
- * shallow twitch on the idle key while the other is held deep is noise,
- * not input).
+ * Two thresholds instead of one is the whole feature, but they answer
+ * different questions. actuation_mm means "this is a keypress" and is the
+ * only thing that decides whether an edge is emitted here. socd_depth_mm
+ * is a deeper mark meaning "this press is being ridden, not tapped"; it
+ * gates nothing in this function - it only sets the `deep` latch that
+ * analog_socd_edge reads when deciding whether an overlap is a deliberate
+ * rock or two taps that happened to touch.
  *
  * `deep` is a latch, deliberately not the same as "currently past
  * socd_depth_mm": once a press has proven itself deep it keeps gating the
@@ -1361,8 +1335,8 @@ static int analog_decode(int fmt, const unsigned char *buf, size_t len,
  *      crosses socd_depth_mm and constitutes a reversal thus resolves
  *      unambiguously as the reversal; an engaged key never re-runs the
  *      fresh-actuation logic.
- *   3. Otherwise (never actuated this engagement, or waiting in
- *      `pending`) the actuation/promotion checks run instead.
+ *   3. Otherwise (never actuated this engagement) the fresh-actuation
+ *      check runs instead.
  *   4. Finally, independent of which of 2/3 fired, the deep latch is
  *      evaluated once against the sample's resulting `live`/depth - so a
  *      sample that reaches socd_depth_mm on the same tick it went live
@@ -1376,14 +1350,7 @@ static int analog_decode(int fmt, const unsigned char *buf, size_t len,
 typedef struct {
     int   live;        /* an edge has been emitted; key counts as pressed */
     int   deep;        /* latched: reached socd_depth_mm during this press */
-    int   pending;     /* actuated but held back, awaiting socd_depth_mm */
     float rt_extreme;  /* local extreme for rapid trigger, mm */
-    float peak;        /* deepest point of the current press, mm */
-    float suppressed;  /* >0: a held-back press just died unpromoted, at
-                        * this depth. Read and cleared by the caller, which
-                        * reports it - the whole feature is invisible in the
-                        * output otherwise, and the number is what you tune
-                        * socd_depth_mm against. */
 } analog_key_t;
 
 typedef struct {
@@ -1395,45 +1362,19 @@ typedef struct {
  * out[] (1 == press, 0 == release, in order) and returns the count. */
 static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
                            const analog_config_t *cfg, int *out) {
-    analog_key_t *self  = &st->key[idx];
-    analog_key_t *other = &st->key[idx ^ 1];
-    int           n     = 0;
-
-    if (depth_mm > self->peak)
-        self->peak = depth_mm;
+    analog_key_t *self = &st->key[idx];
+    int           n    = 0;
 
     /* 1. Full release: master reset. The only place that clears `deep`
      * or zeroes `rt_extreme`. */
     if (depth_mm < cfg->release_mm) {
         if (self->live)
             out[n++] = 0;
-        if (self->pending)
-            self->suppressed = self->peak;   /* never earned its press */
         self->live       = 0;
         self->deep       = 0;
-        self->pending    = 0;
         self->rt_extreme = 0.0f;
-        self->peak       = 0.0f;
         return n;
     }
-
-    /* May this press take ownership while the other key is held deep?
-     *
-     * Reach gate_depth_mm or stay silent. Set too deep it silently swallows
-     * real presses, because a press that never reaches it is never promoted
-     * at all - hence the suppression counter in analog_drain, which is the
-     * number you tune it against. Note this is its OWN threshold, not
-     * socd_depth_mm: that one wants to sit where the keys are ridden, this
-     * one just above an accidental dip.
-     *
-     * This gates the rapid-trigger re-press as well as fresh actuation -
-     * otherwise a finger already resting past actuation_mm before the other
-     * key went deep could still steal via a reversal, which is the exact
-     * misfire this exists to prevent. A genuine rock is unaffected: by then
-     * this key is deep itself. */
-    int gated = 0;
-    if (other->deep && !self->deep && cfg->gate == ANALOG_GATE_DEPTH)
-        gated = depth_mm < cfg->gate_depth_mm;
 
     if (cfg->rt_enabled && self->rt_extreme != 0.0f) {
         /* 2. Already engaged: rapid trigger owns this sample exclusively,
@@ -1462,7 +1403,7 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
                            depth_mm >= cfg->travel_mm - cfg->bottom_out_mm;
             if (depth_mm < self->rt_extreme) {
                 self->rt_extreme = depth_mm;
-            } else if (!gated && depth_mm >= cfg->actuation_mm &&
+            } else if (depth_mm >= cfg->actuation_mm &&
                        (bottomed ||
                         depth_mm - self->rt_extreme >= cfg->rt_press_mm)) {
                 out[n++]         = 1;
@@ -1470,27 +1411,11 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
                 self->rt_extreme = depth_mm;
             }
         }
-    } else if (self->pending) {
-        /* 3a. Promotion: a withheld press earns its way in only by
-         * clearing the gate on its own merits - reaching gate_depth_mm.
-         * Never clearing it emits nothing at all. */
-        if (!gated) {
-            self->pending    = 0;
-            self->live       = 1;
-            self->rt_extreme = depth_mm;
-            out[n++]         = 1;
-        }
     } else if (!self->live && depth_mm >= cfg->actuation_mm) {
-        /* 3b. Fresh actuation. A sample deep enough to qualify on its own
-         * promotes immediately rather than waiting a tick it might never
-         * get - a fast deliberate dive shouldn't pay for the gate. */
-        if (gated) {
-            self->pending = 1;
-        } else {
-            self->live       = 1;
-            self->rt_extreme = depth_mm;
-            out[n++]         = 1;
-        }
+        /* 3. Fresh actuation. */
+        self->live       = 1;
+        self->rt_extreme = depth_mm;
+        out[n++]         = 1;
     }
 
     /* 4. Deep latch, evaluated once against the outcome of 2/3 above. */
@@ -1631,7 +1556,6 @@ typedef struct {
     analog_state_t keys;
     socd_state_t   socd;
     int            regime;         /* 1 == this overlap is SOCD-managed */
-    unsigned       suppressed[2];  /* running count, logged on shutdown */
 } analog_dev_t;
 
 static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
@@ -1679,19 +1603,11 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
              (double)cfg->analog.actuation_mm, (double)cfg->analog.release_mm,
              (double)cfg->analog.socd_depth_mm,
              cfg->analog.rt_enabled ? "on" : "off");
-    if (cfg->analog.gate == ANALOG_GATE_DEPTH)
-        LOG_INFO("Analog gate: depth, %.2fmm",
-                 (double)cfg->analog.gate_depth_mm);
-    else
-        LOG_INFO("Analog gate: off");
     return ad;
 }
 
 static void analog_dev_close(analog_dev_t *ad) {
     if (!ad) return;
-    if (ad->suppressed[0] || ad->suppressed[1])
-        LOG_INFO("Analog: suppressed %u k1 and %u k2 shallow presses",
-                 ad->suppressed[0], ad->suppressed[1]);
     if (ad->fd >= 0) close(ad->fd);
     free(ad);
 }
@@ -2138,17 +2054,6 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
                 int voice = analog_socd_edge(ad, k == 0, edges[e], cfg);
                 if (voice != VOICE_NONE)
                     audio_trigger(voice - 1);
-            }
-            /* Suppressions are accidents, so this is quiet in normal play;
-             * a flood of them means socd_depth_mm is set too deep. */
-            if (ad->keys.key[k].suppressed > 0.0f) {
-                ad->suppressed[k]++;
-                LOG_INFO("k%d: suppressed a %.2fmm press (never reached "
-                         "gate_depth %.2fmm) while k%d was deep [%u so far]",
-                         k + 1, (double)ad->keys.key[k].suppressed,
-                         (double)cfg->analog.gate_depth_mm, (k ^ 1) + 1,
-                         ad->suppressed[k]);
-                ad->keys.key[k].suppressed = 0.0f;
             }
         }
     }

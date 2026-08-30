@@ -178,29 +178,9 @@ the top. It deliberately does **not** track the emitted keys, since rapid
 trigger lifts and re-presses those constantly and a moment where both are
 up is part of the rock, not the end of it.
 
-Separately, while one key *is* held deep, a press on the other has to earn
-the right to take over from it. `analog.gate` decides how:
-
-| mode | rule |
-| --- | --- |
-| `depth` (default) | reach `gate_depth_mm` or emit nothing |
-| `off` | no gating; plain analog toggle plus rapid trigger |
-
-The threshold exists to stop an accidental dip — or a keycap magnet
-bouncing from the shock of a hard hit on the *other* key, which is a real
-effect on Hall-effect boards — from stealing the active key mid-wobble.
-Set it just above where those land and no higher.
-
-The daemon logs every press it suppresses, with the depth it reached, so
-you can tell whether the gate is earning its keep or eating real input.
-
-Note what the gate does to a press it *doesn't* reject: it **withholds** it
-until the threshold is met. So every millimetre of `gate_depth_mm` is
-latency added to a re-press, and a wobble where some beats lift far enough
-to be re-gated and others don't will fire those beats at different times —
-an even finger rhythm coming out as a limp. Keep `gate_depth_mm` shallow,
-just above an accidental dip; it is a separate field from `socd_depth_mm`
-for exactly this reason, since that one wants to be deep.
+`socd_depth_mm` is the only thing standing between a tap and the SOCD
+engine. Nothing else inspects the *incoming* key's depth: once the held key
+is deep, a press on the other is SOCD-managed however shallow it is.
 
 Rapid trigger follows the same shape as Wootility's: `press_mm` and
 `release_mm` are reversal distances, and — as with a full release always

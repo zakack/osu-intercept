@@ -96,23 +96,8 @@ audio:
 # keys mid-rock is part of the gesture, not the end of it, so it rides
 # straight through.
 #
-# Separately, a press has to earn the right to take over from the other key
-# while that key is held deep. How it earns it is set by `gate`:
-#
-#   depth (default) - a press must reach gate_depth_mm. Keep gate_depth_mm
-#       SHALLOW: the gate withholds a press until the threshold is met, so
-#       every extra millimetre is latency added to that press. Set deep, a
-#       re-press that eventually gets there still fires late, and a wobble
-#       where some beats lift far enough to re-gate and others don't turns
-#       into an uneven, limping rhythm. This is its own field precisely
-#       because socd_depth_mm wants the opposite (deep, where you ride the
-#       keys).
-#
-#   off - no gating; plain analog toggle plus rapid trigger.
-#
 # Run `doubletapd -A` to watch live travel depth and pick numbers against
-# your own hands. The daemon also logs every press it suppresses, with the
-# depth it reached - a flood of those means the gate is too aggressive.
+# your own hands.
 #
 # Once a press reaches socd_depth_mm it stays eligible until the key comes
 # all the way back up past release_mm, so easing off mid-roll does not
@@ -133,9 +118,6 @@ audio:
 #                         # small depth instead of vanishing, and at exactly
 #                         # release_mm it would never count as released.
 #   socd_depth_mm: 3.0    # held key deeper than this -> SOCD engages
-#   gate: depth           # depth | off
-#   gate_depth_mm: 1.5    # depth: how deep a fresh press must go. Keep
-#                         # shallow - this is re-press latency.
 #   rapid_trigger:
 #     enabled: true
 #     press_mm: 0.3       # downward reversal that re-presses
