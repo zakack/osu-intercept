@@ -1743,6 +1743,83 @@ static void analog_dev_close(analog_dev_t *ad) {
  * board, and so a key's usage id can be discovered when the keymap walk
  * comes up empty. Deliberately touches nothing else - no grab, no uinput,
  * no audio - so it is safe to run alongside a live daemon. */
+/* -T: dump the travel of k1/k2 to stdout, one line per hardware report,
+ * so a play session can be replayed through the state machine offline.
+ *
+ * Passive, exactly like -A: this opens the hidraw node and resolves the
+ * two HID usages, and does nothing else. No EVIOCGRAB, no uinput device,
+ * nothing in the input path - whoever is recording plays on their own
+ * setup, with their own keyboard behaving normally. That is what makes it
+ * reasonable to ask someone else to run it.
+ *
+ * Both keys are emitted on every line even when only one moved, because a
+ * released key vanishes from the report rather than reporting a zero, so
+ * the absent one really is at rest. Timestamps are monotonic microseconds
+ * from the first report. */
+static int analog_trace(const oid_config_t *cfg, const char *input_dir) {
+    analog_dev_t *ad = analog_dev_open(cfg, input_dir);
+    if (!ad)
+        return EXIT_FAILURE;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    printf("# doubletapd trace v1\n");
+    printf("# travel_mm=%.4f\n", (double)cfg->analog.travel_mm);
+    printf("us,k1_mm,k2_mm\n");
+    fflush(stdout);
+
+    LOG_INFO("Tracing k1/k2 travel to stdout. Play normally; Ctrl-C to stop.");
+
+    struct timespec t0;
+    int             have_t0 = 0;
+    unsigned long   lines   = 0;
+
+    while (g_running) {
+        struct pollfd pfd = { .fd = ad->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 200);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) continue;
+
+        unsigned char buf[ANALOG_V2_REPORT];
+        ssize_t       n = read(ad->fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) continue;
+            LOG_ERR("read(%s): %s", ad->path, strerror(errno));
+            break;
+        }
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (!have_t0) { t0 = now; have_t0 = 1; }
+        long long us = (long long)(now.tv_sec - t0.tv_sec) * 1000000
+                     + (now.tv_nsec - t0.tv_nsec) / 1000;
+
+        analog_sample_t s[ANALOG_SLOTS];
+        int             ns = analog_decode(ad->fmt, buf, (size_t)n, s,
+                                           ANALOG_SLOTS);
+        float depth[2] = { 0.0f, 0.0f };
+        for (int i = 0; i < ns; i++)
+            for (int k = 0; k < 2; k++)
+                if (s[i].code == ad->usage[k])
+                    depth[k] = s[i].depth * cfg->analog.travel_mm;
+
+        printf("%lld,%.4f,%.4f\n", us, (double)depth[0], (double)depth[1]);
+        lines++;
+    }
+
+    fflush(stdout);
+    LOG_INFO("Traced %lu reports.", lines);
+    analog_dev_close(ad);
+    return EXIT_SUCCESS;
+}
+
 static int analog_monitor(const char *forced, const char *input_dir,
                           float travel_mm) {
     char     path[PATH_MAX];
@@ -2416,12 +2493,14 @@ static void print_usage(FILE *s, const char *prog) {
         "configurable keys, and re-emits everything via a\n"
         "single uinput virtual keyboard. Plays a click on each virtual keypress.\n"
         "\n"
-        "usage: %s [-h] [-A] [-c CONFIG] [-i DIR]\n"
+        "usage: %s [-h] [-A|-T] [-c CONFIG] [-i DIR]\n"
         "\n"
         "options:\n"
         "    -h          show this help and exit\n"
         "    -A          analog monitor: print live key travel depth and exit\n"
         "                (for picking thresholds; grabs nothing)\n"
+        "    -T          trace k1/k2 travel as CSV on stdout until Ctrl-C\n"
+        "                (grabs nothing; replay it with the `replay` tool)\n"
         "    -c CONFIG   path to YAML config\n"
         "    -i DIR      directory to scan/watch for event devices\n"
         "                (default /dev/input; mainly for testing)\n"
@@ -2460,14 +2539,18 @@ main(int argc, char **argv) {
     const char *config_path = NULL;
     const char *input_dir   = "/dev/input";
     int         monitor     = 0;
+    int         trace       = 0;
 
-    for (int opt; (opt = getopt(argc, argv, "hAc:i:")) != -1; ) {
+    for (int opt; (opt = getopt(argc, argv, "hATc:i:")) != -1; ) {
         switch (opt) {
             case 'h':
             print_usage(stdout, argv[0]);
             return EXIT_SUCCESS;
             case 'A':
             monitor = 1;
+            break;
+            case 'T':
+            trace = 1;
             break;
             case 'c':
             config_path = optarg;
@@ -2489,6 +2572,12 @@ main(int argc, char **argv) {
     config_init(&cfg);
     if (load_config(config_path, &cfg) != 0)
         return EXIT_FAILURE;
+
+    if (trace) {
+        int rc = analog_trace(&cfg, input_dir);
+        config_free(&cfg);
+        return rc;
+    }
 
     if (monitor) {
         int rc = analog_monitor(cfg.analog.device, input_dir,

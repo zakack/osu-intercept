@@ -65,6 +65,12 @@ scanned/watched device directory (default `/dev/input`) — mainly for
 integration testing against a directory of symlinks to synthetic uinput
 nodes. The `-A` flag runs the analog monitor (live travel depth, no grab,
 no uinput device) for picking thresholds and discovering HID usage ids.
+`-T` is the same passivity with machine-readable output: CSV of k1/k2
+travel per report, for replaying a session offline. `tools/replay.c`
+consumes it — built on demand with `cmake --build build --target replay`,
+excluded from `all`, and NOT installed. It `#include`s `doubletapd.c` and
+stubs only the uinput writes, so it exercises the daemon's real state
+machine rather than a copy that could drift; keep it that way.
 
 ## Architecture
 

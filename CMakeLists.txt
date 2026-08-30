@@ -62,6 +62,43 @@ target_link_libraries(doubletapd PRIVATE
     ${LIBYAML_LIBRARIES}
 )
 
+# Developer tool, not installed: replays a `doubletapd -T` trace through the
+# real analog state machine offline. It #includes doubletapd.c and stubs the
+# uinput writes, so it exercises the daemon's own code rather than a copy.
+# EXCLUDE_FROM_ALL - build it on demand with `--target replay`.
+add_executable(replay EXCLUDE_FROM_ALL tools/replay.c)
+
+target_compile_definitions(replay PRIVATE
+    DEF_WAV="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/click.wav"
+    DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/config.yaml"
+)
+
+target_compile_options(replay PRIVATE
+    -Wall -Wextra
+    ${PIPEWIRE_CFLAGS_OTHER}
+    ${LIBEVDEV_CFLAGS_OTHER}
+    ${LIBYAML_CFLAGS_OTHER}
+)
+
+target_include_directories(replay PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${PIPEWIRE_INCLUDE_DIRS}
+    ${LIBEVDEV_INCLUDE_DIRS}
+    ${LIBYAML_INCLUDE_DIRS}
+)
+
+target_link_directories(replay PRIVATE
+    ${PIPEWIRE_LIBRARY_DIRS}
+    ${LIBEVDEV_LIBRARY_DIRS}
+    ${LIBYAML_LIBRARY_DIRS}
+)
+
+target_link_libraries(replay PRIVATE
+    ${PIPEWIRE_LIBRARIES}
+    ${LIBEVDEV_LIBRARIES}
+    ${LIBYAML_LIBRARIES}
+)
+
 configure_file(doubletap.service.in doubletap.service @ONLY)
 
 install(TARGETS doubletapd RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

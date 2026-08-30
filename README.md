@@ -230,6 +230,31 @@ all the way up past `release_mm`, so easing off mid-roll does not demote it
 trigger comes along for the ride, since the daemon is computing actuation
 itself either way.
 
+### Recording and replaying a session
+
+`-T` writes the travel of k1/k2 to stdout, one line per hardware report,
+until Ctrl-C. Like `-A` it is completely passive — it opens the keyboard's
+hidraw node and nothing else, so there is no grab, no virtual device, and
+nothing in the input path. Whoever records plays on their own setup with
+their own keyboard behaving exactly as it normally does.
+
+```sh
+./build/doubletapd -T > session.csv     # play, then Ctrl-C
+cmake --build build --target replay
+./build/replay session.csv
+```
+
+`replay` runs the recording back through the daemon's own analog state
+machine — it `#include`s `doubletapd.c` and stubs only the uinput writes, so
+it cannot drift from what the daemon actually does. It reports how many
+times the SOCD regime engaged, how many virtual presses were emitted, a
+histogram of how deep the keypresses actually went, and a sweep of
+engagements against `socd_depth_mm` so you can see where it reaches zero.
+
+The depth histogram is the interesting part if you are wondering whether a
+given playstyle can trigger the regime at all: a player who never presses
+past half travel cannot engage it, whatever their timing does.
+
 ### Picking thresholds
 
 Run the analog monitor and watch your own travel depth:
