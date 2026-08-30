@@ -1668,7 +1668,11 @@ typedef struct {
     char           path[PATH_MAX];
     analog_state_t keys;
     socd_state_t   socd;
-    int            regime;         /* 1 == this overlap is SOCD-managed */
+    int            regime;      /* 1 == this overlap is SOCD-managed */
+    int            last_press;  /* 0 == k1, 1 == k2: most recent press edge.
+                                 * Picks which key keeps its virtual on when
+                                 * the regime engages with both already
+                                 * down - last input wins. */
 } analog_dev_t;
 
 static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
@@ -2076,69 +2080,114 @@ static int drain_device(input_dev_t *in, const oid_config_t *cfg) {
     return 0;
 }
 
-/* Route one synthesized edge into the SOCD core, deciding first whether
- * this overlap is SOCD-managed at all.
+/* Which virtual keys `mode` would be holding down, given which physical
+ * keys `held` says are down. SOCD_OFF mirrors one-to-one; the toggle holds
+ * exactly one - the `act` one - whenever anything at all is held. Used to
+ * diff the two modes against each other when the regime changes under held
+ * fingers. */
+static void socd_virtual_state(const int *held, int act, int mode,
+                               int *down) {
+    down[0] = down[1] = 0;
+    if (mode == SOCD_OFF) {
+        down[0] = held[0];
+        down[1] = held[1];
+    } else if (held[0] || held[1]) {
+        down[act ? 0 : 1] = 1;
+    }
+}
+
+/* Switch the regime on or off, reconciling the virtual keys as we go.
  *
- * That choice is made once, when the second key goes down, and held for the
- * rest of the overlap. Both keys deep means the player is riding the bottom
- * and wants the toggle; anything shallower is ordinary alternate tapping,
- * where the two keys must stay independent - running the toggle there turns
- * an incidental overlap into an extra keypress, which is exactly the misfire
- * this mode exists to remove.
+ * The two modes disagree about what should be held: OFF wants a virtual key
+ * per held physical key, the toggle wants exactly one. Flipping the flag
+ * without settling that difference is what strands a key - the toggle can
+ * legitimately leave `act` on a finger that has already lifted, and a later
+ * release routed through OFF writes only its own code, so whatever the
+ * toggle pressed is never released. So compute both pictures and emit the
+ * difference.
  *
- * Latching at the second press rather than re-deciding per sample matters:
- * switching regimes mid-overlap would desynchronize `act` from the virtual
- * keys already emitted. On entry we seed `act` with the already-held key, so
- * the core's S_PRESS releases the right one. */
+ * Engaging with both keys already down (the second one having gone deep
+ * while its virtual key was on from the plain-remap path) means one of them
+ * has to let go. The most recently pressed key keeps it: last input wins,
+ * the same principle the core runs on. */
+static void analog_regime_set(analog_dev_t *ad, int on,
+                              const oid_config_t *cfg) {
+    /* Where the virtual keys stand comes from socd, which reflects the
+     * edges already APPLIED. Where they should end up comes from the
+     * front-end's `live`, which is this sample's truth - socd still lags it
+     * by whatever edges have not been routed yet. Targeting socd instead
+     * would press a key for a finger that left on this very sample, then
+     * release it again when the edge lands: a phantom note on the way out
+     * of a wobble. */
+    int cur[2]  = { ad->socd.k1, ad->socd.k2 };
+    int next[2] = { ad->keys.key[0].live, ad->keys.key[1].live };
+    int from[2], to[2];
+
+    socd_virtual_state(cur, ad->socd.act,
+                       ad->regime ? cfg->socd : SOCD_OFF, from);
+
+    if (on) {
+        int keep = ad->last_press;
+        if (!next[keep]) keep = !keep;      /* it lifted; the other has it */
+        ad->socd.act = (keep == 0);
+    }
+    ad->regime = on;
+    socd_virtual_state(next, ad->socd.act, on ? cfg->socd : SOCD_OFF, to);
+
+    for (int k = 0; k < 2; k++) {
+        if (from[k] == to[k]) continue;
+        libevdev_uinput_write_event(uidev, EV_KEY,
+                                    k == 0 ? cfg->v1 : cfg->v2, to[k]);
+        libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+        if (to[k])
+            audio_trigger(k);   /* a press is a press; keep click and
+                                 * emitted output in step */
+    }
+}
+
+/* Decide whether this is a wobble, once both keys have been fed.
+ *
+ * Engagement is a POSTURE, not an event: both keys ridden past
+ * socd_depth_mm at the same time. Until then one key deep and the other
+ * tapping is left completely alone - the deep key is simply held while the
+ * other taps, which is a real thing to want and not a misfire. That is the
+ * opposite of testing the incoming key at its press edge, which cannot
+ * work: the edge fires at actuation_mm, before the key has travelled, so it
+ * is never deep at that instant. Here the second key joins on its own
+ * schedule, on whatever sample it crosses the line, emitting nothing.
+ *
+ * Engaging also demands both keys be LIVE, which is what keeps fast
+ * alternation out. Tapping k1 to the floor and off again leaves it latched
+ * deep until it clears release_mm, so if k2 bottoms out in that window both
+ * are deep - but k1's rapid-trigger release has already fired by then, so
+ * it is not live and nothing engages. At the start of a deliberate wobble
+ * both fingers are resting on the floor and both are live.
+ *
+ * Lapsing does NOT test live, deliberately. Rapid trigger lifts and
+ * re-presses the emitted keys constantly, so a moment where one is up is
+ * mid-rock, not the end of the gesture; only `deep` clearing - a finger
+ * actually leaving the switch - ends it. The asymmetry is the point:
+ * getting in takes commitment, staying in does not. */
+static void analog_regime_update(analog_dev_t *ad, const oid_config_t *cfg) {
+    int deep = ad->keys.key[0].deep && ad->keys.key[1].deep;
+
+    if (!ad->regime) {
+        if (deep && ad->keys.key[0].live && ad->keys.key[1].live)
+            analog_regime_set(ad, 1, cfg);
+    } else if (!deep) {
+        analog_regime_set(ad, 0, cfg);
+    }
+}
+
+/* Route one synthesized edge into the SOCD core under whatever regime is in
+ * force. The regime itself is resolved once per sample in analog_drain,
+ * before any of that sample's edges are applied. */
 static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
                             const oid_config_t *cfg) {
-    if (value == 1) {
-        int other      = is_k1 ? 1 : 0;
-        int other_down = is_k1 ? ad->socd.k2 : ad->socd.k1;
-
-        /* Only the ALREADY-HELD key's depth is meaningful here. The key
-         * going down right now has barely travelled - its press edge fires
-         * at actuation, or at a rapid-trigger reversal - so it cannot yet
-         * be past socd_depth_mm, and demanding that it is makes engagement
-         * depend on how far a rapid-trigger re-press happens to land. That
-         * is stable only when socd_depth_mm sits above where re-presses
-         * fire, and turns into a coin flip as it approaches them. The held
-         * key being ridden deep is the actual signal that this is a wobble
-         * and not alternate tapping. */
-        if (other_down && !ad->regime && ad->keys.key[other].deep) {
-            ad->regime   = 1;
-            ad->socd.act = !is_k1;   /* the held key is the active one */
-        }
-    }
-
-    int mode  = ad->regime ? cfg->socd : SOCD_OFF;
-    int voice = socd_apply(&ad->socd, is_k1, value, mode, cfg);
-
-    /* The regime ends only when a key comes all the way back up, which is
-     * precisely what clears `deep`. It must NOT be tied to the emitted key
-     * state: rapid trigger releases and re-presses constantly, so a moment
-     * where both virtual keys happen to be up is just part of the rock, not
-     * the end of the gesture. Dropping the regime there costs a beat to
-     * plain mode before the toggle can re-engage, which is audible.
-     *
-     * It lapses once NEITHER key is deep any more - if it required both,
-     * a wobble whose second key never crossed the threshold would drop the
-     * regime on the very next sample. Checked after the edge, not before,
-     * so the release that ends a wobble is still handled under the toggle
-     * and reverts correctly.
-     *
-     * It must ALSO wait until nothing is still held. Changing the effective
-     * mode while a virtual key is down strands it: the reverting toggle can
-     * legitimately leave `act` on a key whose finger has already lifted, and
-     * if the remaining release then routes through SOCD_OFF it writes only
-     * its own code, so whatever the toggle pressed is never released. Both
-     * physical keys being up is the one point where the two modes agree that
-     * nothing is emitted, so it is the only safe place to switch. */
-    if (!ad->keys.key[0].deep && !ad->keys.key[1].deep &&
-        !ad->socd.k1 && !ad->socd.k2)
-        ad->regime = 0;
-
-    return voice;
+    if (value == 1)
+        ad->last_press = is_k1 ? 0 : 1;
+    return socd_apply(&ad->socd, is_k1, value,
+                      ad->regime ? cfg->socd : SOCD_OFF, cfg);
 }
 
 /* Read every queued analog report and turn travel depth into SOCD edges.
@@ -2169,16 +2218,28 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
                 if (s[i].code == ad->usage[k])
                     depth[k] = s[i].depth * cfg->analog.travel_mm;
 
-        for (int k = 0; k < 2; k++) {
-            int edges[2];
-            int ne = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
-                                     edges);
-            for (int e = 0; e < ne; e++) {
-                int voice = analog_socd_edge(ad, k == 0, edges[e], cfg);
+        /* Feed both keys before judging either: engagement and lapse read
+         * the deep/live state of BOTH, which is only complete once both
+         * have been fed. The regime is then resolved BEFORE this sample's
+         * edges are applied, so every edge runs under the mode actually in
+         * force for it. That ordering is what stops the lift ending a
+         * wobble from being reverted by a toggle on its way out - the
+         * release lands as a plain release, and the reconciliation in
+         * analog_regime_set has already put the virtual keys where OFF
+         * expects them. */
+        int edges[2][2], ne[2];
+        for (int k = 0; k < 2; k++)
+            ne[k] = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
+                                    edges[k]);
+
+        analog_regime_update(ad, cfg);
+
+        for (int k = 0; k < 2; k++)
+            for (int e = 0; e < ne[k]; e++) {
+                int voice = analog_socd_edge(ad, k == 0, edges[k][e], cfg);
                 if (voice != VOICE_NONE)
                     audio_trigger(voice - 1);
             }
-        }
     }
     return 0;
 }

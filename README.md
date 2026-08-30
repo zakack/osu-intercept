@@ -178,9 +178,22 @@ the top. It deliberately does **not** track the emitted keys, since rapid
 trigger lifts and re-presses those constantly and a moment where both are
 up is part of the rock, not the end of it.
 
-`socd_depth_mm` is the only thing standing between a tap and the SOCD
-engine. Nothing else inspects the *incoming* key's depth: once the held key
-is deep, a press on the other is SOCD-managed however shallow it is.
+The SOCD engine engages on a **posture**, not an event: both keys ridden
+past `socd_depth_mm` at the same time, both still pressed. Until that
+happens the two keys are completely independent, so:
+
+- **Both shallow** — ordinary alternate tapping, nothing to do with SOCD.
+- **One deep, one tapping** — the deep key is simply held while the other
+  taps. A real thing to want, and no longer mistaken for a misfire.
+- **Both deep** — the wobble. The toggle takes over and the rocking begins.
+
+Getting in takes commitment; staying in does not. Engagement additionally
+requires both keys to be *emitting-pressed*, which keeps fast alternation
+out — a key tapped to the floor stays latched deep until it comes back up
+past `release_mm`, but its rapid-trigger release has already fired, so it
+is not live when the other key lands. The regime then rides through the
+constant lifting and re-pressing of a wobble, ending only when a finger
+actually leaves a switch.
 
 Rapid trigger follows the same shape as Wootility's: `press_mm` and
 `release_mm` are reversal distances, and — as with a full release always

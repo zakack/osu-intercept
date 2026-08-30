@@ -185,22 +185,42 @@ down in reverse order.
   Adding a behavior to one path and not the other is almost always a bug.
   It takes the mode as an argument rather than reading `cfg->socd`, which is
   what lets the analog path run a shallow overlap as a plain remap.
-- `analog_socd_edge` decides whether an overlap is SOCD-managed at all:
-  when the ALREADY-HELD key is `deep`. Testing the newly-pressed key too is
-  wrong — its press edge fires at actuation or at a rapid-trigger reversal,
-  before it has travelled, so engagement would hinge on where re-presses
-  happen to land relative to `socd_depth_mm`. Gating the *emission* of a press is not enough
-  — two shallow presses that both reach `socd_apply` still trigger the
-  toggle, which turns an incidental overlap during alternate tapping into an
-  extra keypress. The decision is latched at the second press and held until
-  a key fully releases (i.e. until `deep` clears); re-deciding mid-overlap
-  would desynchronize `act` from the virtual keys already emitted.
-- That latch keys off `deep`, NOT off `socd.k1`/`socd.k2`. Rapid trigger
-  lifts and re-presses the emitted keys constantly, so a moment where both
-  are up is mid-rock, not the end of the gesture — resetting the regime
-  there costs a beat to plain mode before the toggle re-engages. The reset
-  is checked after the edge is applied, so the release ending a wobble is
-  still reverted under the toggle.
+- The regime engages on a POSTURE: BOTH keys past `socd_depth_mm` at once,
+  and both `live`. One key deep while the other taps is deliberately left
+  alone — the deep key is simply held while the other taps, which is a real
+  thing to want. Engagement is resolved once per sample in
+  `analog_regime_update`, called from `analog_drain` after both keys have
+  been fed and BEFORE that sample's edges are applied, so every edge runs
+  under the mode actually in force for it. It cannot live on the press edge:
+  that fires at `actuation_mm`, before the key has travelled, so the
+  incoming key is never deep at that instant.
+- Engagement tests `live`, the lapse does NOT. Rapid trigger lifts and
+  re-presses constantly, so a moment where one key is up is mid-rock, not
+  the end of the gesture; only `deep` clearing ends it. The asymmetry keeps
+  fast alternation out (a key tapped to the floor stays latched deep until
+  it clears `release_mm`, but its rapid-trigger release has already fired,
+  so it is not live) while letting an engaged wobble ride.
+- Changing regime under held fingers MUST reconcile the virtual keys, which
+  is what `analog_regime_set` does: the two modes disagree about what should
+  be down (OFF wants one virtual key per held physical key, the toggle wants
+  exactly one), and flipping the flag without settling that strands a key.
+  The current picture comes from `socd`, which reflects edges already
+  APPLIED; the target picture comes from the front-end's `live`, which is
+  this sample's truth. Using `socd` for the target presses a key for a
+  finger that left on this very sample and releases it again when the edge
+  lands — a phantom note on the way out of a wobble.
+- Engagement must never be evaluated at a press edge, however tempting. The
+  edge fires at `actuation_mm` or at a rapid-trigger reversal, before the
+  key has travelled, so any test of the incoming key's depth there hinges on
+  where re-presses happen to land relative to `socd_depth_mm` — stable only
+  while the threshold sits above them, a coin flip as it approaches. The
+  per-sample check exists precisely so the second key can cross the line on
+  its own schedule, emitting nothing.
+- Gating the *emission* of a press is not a substitute for gating the
+  regime: two presses that both reach `socd_apply` still trigger the toggle,
+  which is what turns an incidental overlap into an extra keypress.
+- Regime state keys off `deep` and `live`, NOT off `socd.k1`/`socd.k2`.
+  Those track edges already applied and lag the front-end by a sample.
 - In analog mode the digital k1/k2 of the analog keyboard MUST be dropped
   (`in->analog`, set by matching vendor/product in `input_try_open`), or
   every press is emitted twice — once from evdev and once from analog.
