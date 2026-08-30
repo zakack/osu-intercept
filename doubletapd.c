@@ -2134,14 +2134,28 @@ static void analog_regime_set(analog_dev_t *ad, int on,
     ad->regime = on;
     socd_virtual_state(next, ad->socd.act, on ? cfg->socd : SOCD_OFF, to);
 
+    /* Reconciliation only ever RELEASES. Engaging never wants a press
+     * anyway - it goes from two virtual keys down to one - and on the way
+     * out a press would be a spurious note.
+     *
+     * That matters because `deep` does not clear until release_mm, so a
+     * finger leaving the switch is still inside the regime while it rises:
+     * its rapid-trigger release fires at deep_release_mm off the floor and
+     * the reverting toggle answers it by pressing the OTHER key, which is
+     * the one being lifted. Pressing the still-held key here to put OFF's
+     * picture right would then fire a second note for the same departure.
+     * One beat per lift, not two.
+     *
+     * The cost is that the still-held key's virtual is left up until that
+     * key next moves, at which point the plain remap presses it again. In
+     * practice a finger that stays down after a wobble is about to tap or
+     * lift anyway, and either resyncs it. */
     for (int k = 0; k < 2; k++) {
-        if (from[k] == to[k]) continue;
-        libevdev_uinput_write_event(uidev, EV_KEY,
-                                    k == 0 ? cfg->v1 : cfg->v2, to[k]);
-        libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-        if (to[k])
-            audio_trigger(k);   /* a press is a press; keep click and
-                                 * emitted output in step */
+        if (from[k] && !to[k]) {
+            libevdev_uinput_write_event(uidev, EV_KEY,
+                                        k == 0 ? cfg->v1 : cfg->v2, 0);
+            libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+        }
     }
 }
 

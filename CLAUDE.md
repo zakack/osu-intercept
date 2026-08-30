@@ -209,6 +209,18 @@ down in reverse order.
   this sample's truth. Using `socd` for the target presses a key for a
   finger that left on this very sample and releases it again when the edge
   lands — a phantom note on the way out of a wobble.
+- Reconciliation only ever RELEASES, never presses. `deep` does not clear
+  until `release_mm`, so a finger leaving is still inside the regime while
+  it rises: its rapid-trigger release fires at `deep_release_mm` off the
+  floor and the reverting toggle answers by pressing the OTHER key — the
+  one being lifted. Pressing the still-held key here to complete OFF's
+  picture would fire a SECOND note for the same departure. One beat per
+  lift. The still-held key's virtual is left up until that key next moves,
+  where the plain remap presses it again. No threshold fixes this: the rt
+  release always fires inside the deep zone, since `deep_release_mm` is
+  necessarily smaller than the gap between the floor and `socd_depth_mm`.
+  The only alternative is snappy release semantics, which halves the
+  wobble's note rate — a feel change, not a fix.
 - Engagement must never be evaluated at a press edge, however tempting. The
   edge fires at `actuation_mm` or at a rapid-trigger reversal, before the
   key has travelled, so any test of the incoming key's depth there hinges on
