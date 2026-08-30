@@ -645,6 +645,32 @@ static int analog_config_check(const analog_config_t *a) {
                 "both keys is what starts a wobble");
         bad = 1;
     }
+    /* Actuation has to sit above the backplate, or a key reaches the floor
+     * without ever registering as pressed: it could never latch as
+     * committed, so the wobble could never start, and with actuation past
+     * travel_mm it could never actuate at all. Both are silent bricks. */
+    if (a->travel_mm > 0.0f && a->bottom_out_mm > 0.0f &&
+        a->actuation_mm >= a->travel_mm - a->bottom_out_mm) {
+        LOG_ERR("'analog.actuation_mm' (%.3f) must be shallower than the "
+                "backplate at %.3fmm (travel_mm - bottom_out_mm), otherwise "
+                "a key can reach the floor without ever actuating",
+                (double)a->actuation_mm,
+                (double)(a->travel_mm - a->bottom_out_mm));
+        bad = 1;
+    }
+    if (a->bottom_out_mm >= a->travel_mm) {
+        LOG_ERR("'analog.rapid_trigger.bottom_out_mm' (%.3f) must be less "
+                "than travel_mm (%.3f): every sample would count as "
+                "bottomed",
+                (double)a->bottom_out_mm, (double)a->travel_mm);
+        bad = 1;
+    }
+    if (a->hid_k1 >= 0 && a->hid_k1 == a->hid_k2) {
+        LOG_ERR("'analog.hid_k1' and 'analog.hid_k2' are both 0x%02x: one "
+                "physical key would drive both virtual keys",
+                a->hid_k1);
+        bad = 1;
+    }
     if (bad)
         return -1;
 
@@ -1441,8 +1467,10 @@ typedef struct {
 } analog_state_t;
 
 /* Feed one sample for one key. idx is 0 (k1) or 1 (k2); a key absent from
- * the hardware report is fed depth_mm == 0.0f. Writes up to 2 edges to
- * out[] (1 == press, 0 == release, in order) and returns the count. */
+ * the hardware report is fed depth_mm == 0.0f. Writes at most ONE edge to
+ * out[] (1 == press, 0 == release) and returns the count: rule 1 returns
+ * early and rules 2/3 are mutually exclusive, so no path emits two. The
+ * array is kept at two so callers need not change if that ever does. */
 static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
                            const analog_config_t *cfg, int riding, int *out) {
     analog_key_t *self = &st->key[idx];
@@ -2284,8 +2312,18 @@ static void analog_regime_update(analog_dev_t *ad, const oid_config_t *cfg,
      * only one virtual key is down at this point, because the press that
      * completes the pair has not been applied yet. */
     if (!ad->regime) {
+        /* `deep` as well as bottomed, so engaging and lapsing agree about
+         * what commitment means. In any sane config it is implied - the
+         * backplate is far below actuation_mm, so a bottomed key is live
+         * and rule 4 has already latched it by the time this runs - but
+         * without it a config whose actuation sits below the backplate
+         * could engage with neither key registering as pressed, and then
+         * lapse again on the next sample because the lapse DOES test
+         * `deep`. The config check below rejects that config too; this
+         * keeps the two halves of the rule honest regardless. */
         float floor_mm = cfg->analog.travel_mm - cfg->analog.bottom_out_mm;
-        if (depth[0] >= floor_mm && depth[1] >= floor_mm)
+        if (depth[0] >= floor_mm && depth[1] >= floor_mm &&
+            ad->keys.key[0].deep && ad->keys.key[1].deep)
             analog_regime_set(ad, 1, cfg);
     }
 }

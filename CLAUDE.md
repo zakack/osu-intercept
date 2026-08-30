@@ -263,14 +263,6 @@ down in reverse order.
   every press is emitted twice — once from evdev and once from analog.
 - `analog_key_feed` must keep `live` in sync with the edges it actually
   emits; `socd_apply` assumes strict press/release alternation per key.
-- The rapid-trigger profile is selected on the ANCHOR (`rt_extreme`), never
-  on the current depth and never on a latch. The anchor already carries the
-  right meaning on both sides: while `live` it is the deepest point of this
-  press ("did this press go deep"), while not `live` it is the shallowest
-  point since the release ("did the lift stay deep"). A latch such as `deep`
-  would strand a finger that dived once and then came up to tap without
-  fully releasing on a profile that emits nothing; the anchor recovers on
-  the next sample.
 - A zero `rt_deep_press_mm`/`rt_deep_release_mm` means that zone's edge is
   DISABLED, not that any motion triggers it. The config parser rejects a
   literal `0` and requires `off`, because the two readings are opposites.
