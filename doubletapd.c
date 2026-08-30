@@ -448,6 +448,16 @@ typedef struct {
     int    rt_enabled;
     float  rt_press_mm;   /* downward reversal that re-presses */
     float  rt_release_mm; /* upward reversal that releases */
+    /* Rapid trigger runs two profiles. The anchor (rt_extreme) decides
+     * which: at or past rt_deep_mm the finger is riding, otherwise it is
+     * tapping. In the resolved config a negative rt_deep_* means "unset";
+     * analog_config_resolve replaces those with the tapping value (or
+     * socd_depth_mm), so an unconfigured daemon behaves exactly as it did
+     * with one profile. 0 means the edge is disabled in that zone. */
+    float  rt_deep_mm;         /* split point; <0 == follow socd_depth_mm */
+    float  rt_deep_press_mm;   /* riding re-press; 0 == bottom-out only */
+    float  rt_deep_release_mm; /* riding release; 0 == holds until full
+                                * release (Keychron's bottom dead zone) */
     float  bottom_out_mm; /* within this of full travel == bottomed out, which
                            * presses regardless of rt_press_mm; 0 disables */
     int    hid_k1;        /* HID usage override; -1 == derive from the keymap */
@@ -488,6 +498,9 @@ static void config_init(oid_config_t *c) {
     c->analog.rt_enabled    = 1;
     c->analog.rt_press_mm   = 0.3f;
     c->analog.rt_release_mm = 0.3f;
+    c->analog.rt_deep_mm         = -1.0f;   /* unset: follow socd_depth_mm */
+    c->analog.rt_deep_press_mm   = -1.0f;   /* unset: mirror rt_press_mm   */
+    c->analog.rt_deep_release_mm = -1.0f;   /* unset: mirror rt_release_mm */
     c->analog.bottom_out_mm = 0.1f;
     c->analog.hid_k1        = -1;   /* sentinel: derive from the keymap */
     c->analog.hid_k2        = -1;
@@ -557,6 +570,32 @@ static int parse_gain(yaml_node_t *n, float *out) {
     return 0;
 }
 
+/* A rapid-trigger reversal distance that may be switched off entirely.
+ * "off" means no travel-based edge in that zone; a plain number is the
+ * distance. Returns 0 on success, 1 for a literal 0 (rejected on purpose:
+ * as a distance it would mean "any motion at all triggers", the exact
+ * opposite of what someone writing 0 to disable it intends), -1 for junk. */
+static int parse_reversal(yaml_node_t *n, float *out) {
+    if (!n || n->type != YAML_SCALAR_NODE) return -1;
+    if (!strcasecmp((const char *)n->data.scalar.value, "off")) {
+        *out = 0.0f;
+        return 0;
+    }
+    float v;
+    if (parse_gain(n, &v) != 0) return -1;
+    if (v == 0.0f) return 1;
+    *out = v;
+    return 0;
+}
+
+/* Fill in the deep profile from the tapping profile wherever the config
+ * left it unset, so everything downstream reads concrete numbers. */
+static void analog_config_resolve(analog_config_t *a) {
+    if (a->rt_deep_mm < 0.0f)         a->rt_deep_mm         = a->socd_depth_mm;
+    if (a->rt_deep_press_mm < 0.0f)   a->rt_deep_press_mm   = a->rt_press_mm;
+    if (a->rt_deep_release_mm < 0.0f) a->rt_deep_release_mm = a->rt_release_mm;
+}
+
 /* Thresholds that are individually well-formed can still combine into a
  * broken machine, and the failure modes are hard to attribute while playing:
  * a key that self-oscillates at the report rate, or one whose deep latch can
@@ -589,10 +628,23 @@ static int analog_config_check(const analog_config_t *a) {
                 "otherwise a held key releases itself");
         bad = 1;
     }
+    /* Nothing could ever re-press a key in the riding zone: travel is
+     * switched off and there is no backplate rule to fall back on. */
+    if (a->rt_enabled && a->rt_deep_press_mm == 0.0f &&
+        a->bottom_out_mm <= 0.0f) {
+        LOG_ERR("'analog.rapid_trigger.deep_press_mm' is off and "
+                "'bottom_out_mm' is 0: a key in the riding zone could never "
+                "re-press at all");
+        bad = 1;
+    }
     if (bad)
         return -1;
 
     /* Survivable, but almost certainly not what was meant. */
+    if (a->rt_enabled && a->rt_deep_mm > a->travel_mm)
+        LOG_WARN("'analog.rapid_trigger.deep_mm' (%.3f) exceeds travel_mm "
+                 "(%.3f): the riding profile can never apply",
+                 (double)a->rt_deep_mm, (double)a->travel_mm);
     if (a->bottom_out_mm >= a->travel_mm)
         LOG_WARN("'analog.rapid_trigger.bottom_out_mm' (%.3f) >= travel_mm "
                  "(%.3f): every sample counts as bottomed out",
@@ -808,6 +860,35 @@ static int load_config(const char *path, oid_config_t *c) {
                         "non-negative number");
                 goto out;
             }
+            yaml_node_t *dm = map_get(&doc, rt, "deep_mm");
+            if (dm && parse_gain(dm, &c->analog.rt_deep_mm) != 0) {
+                LOG_ERR("'analog.rapid_trigger.deep_mm' must be a "
+                        "non-negative number");
+                goto out;
+            }
+            static const struct { const char *key; size_t off; } dv[] = {
+                { "deep_press_mm",
+                  offsetof(analog_config_t, rt_deep_press_mm)   },
+                { "deep_release_mm",
+                  offsetof(analog_config_t, rt_deep_release_mm) },
+            };
+            for (size_t i = 0; i < sizeof(dv) / sizeof(dv[0]); i++) {
+                yaml_node_t *v = map_get(&doc, rt, dv[i].key);
+                if (!v) continue;
+                int r = parse_reversal(
+                    v, (float *)((char *)&c->analog + dv[i].off));
+                if (r > 0) {
+                    LOG_ERR("'analog.rapid_trigger.%s' cannot be 0 - write "
+                            "\"off\" to disable it, or a distance",
+                            dv[i].key);
+                    goto out;
+                }
+                if (r < 0) {
+                    LOG_ERR("'analog.rapid_trigger.%s' must be a positive "
+                            "number or \"off\"", dv[i].key);
+                    goto out;
+                }
+            }
         }
         static const struct { const char *key; size_t off; } hid[] = {
             { "hid_k1", offsetof(analog_config_t, hid_k1) },
@@ -899,6 +980,7 @@ static int load_config(const char *path, oid_config_t *c) {
         if (!c->uinput_name) { LOG_ERR("oom"); goto out; }
     }
 
+    analog_config_resolve(&c->analog);
     if (c->socd == SOCD_ANALOG && analog_config_check(&c->analog) != 0)
         goto out;
 
@@ -1376,14 +1458,35 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
         return n;
     }
 
+    /* Which rapid-trigger profile this sample runs under.
+     *
+     * The selector is the ANCHOR, not the current depth, and the anchor
+     * already means the right thing on both sides of the branch below:
+     * while live it is the deepest point of this press, so the test reads
+     * "did this press go deep - must the lift be deliberate?"; while not
+     * live it is the shallowest point since the release, so it reads "did
+     * the lift stay deep - is this a wobble rather than a fresh tap?".
+     * One expression, correct in both.
+     *
+     * Selecting on the anchor rather than a latch is what keeps it honest:
+     * lift out of the riding zone and the tapping profile applies on the
+     * very next sample. A latch (`deep`, say) would strand a finger that
+     * dived once and then came up to tap without fully releasing, leaving
+     * it on a profile that emits nothing. */
+    int   riding  = self->rt_extreme >= cfg->rt_deep_mm;
+    float press   = riding ? cfg->rt_deep_press_mm   : cfg->rt_press_mm;
+    float release = riding ? cfg->rt_deep_release_mm : cfg->rt_release_mm;
+
     if (cfg->rt_enabled && self->rt_extreme != 0.0f) {
         /* 2. Already engaged: rapid trigger owns this sample exclusively,
          * tracking the local extreme and firing on a large enough
-         * reversal in either direction. */
+         * reversal in either direction. A zero distance disables that
+         * zone's edge outright - the key then holds until rule 1. */
         if (self->live) {
             if (depth_mm > self->rt_extreme) {
                 self->rt_extreme = depth_mm;
-            } else if (self->rt_extreme - depth_mm >= cfg->rt_release_mm) {
+            } else if (release > 0.0f &&
+                       self->rt_extreme - depth_mm >= release) {
                 out[n++]         = 0;
                 self->live       = 0;
                 self->rt_extreme = depth_mm;
@@ -1393,8 +1496,10 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
              * since the last reversal - the mirror of rule 1, where a full
              * release always releases however small the up-travel. Riding
              * the backplate as the neutral position depends on this: with a
-             * large rt_press_mm, a wobble that ends against the bottom never
-             * travels far enough to satisfy the reversal test on its own. */
+             * large press distance - or with deep_press_mm off, where the
+             * backplate is the ONLY thing that re-presses - a wobble that
+             * ends against the bottom never travels far enough to satisfy
+             * the reversal test on its own. */
             /* A re-press still has to clear actuation_mm: without that
              * floor, a reversal entirely within the top fraction of travel
              * synthesizes whole keystrokes where the sensor is least
@@ -1405,7 +1510,8 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
                 self->rt_extreme = depth_mm;
             } else if (depth_mm >= cfg->actuation_mm &&
                        (bottomed ||
-                        depth_mm - self->rt_extreme >= cfg->rt_press_mm)) {
+                        (press > 0.0f &&
+                         depth_mm - self->rt_extreme >= press))) {
                 out[n++]         = 1;
                 self->live       = 1;
                 self->rt_extreme = depth_mm;
@@ -1423,6 +1529,13 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
         self->deep = 1;
 
     return n;
+}
+
+/* Render a reversal distance for the log: "off" when disabled. */
+static const char *fmt_reversal(char *buf, size_t sz, float v) {
+    if (v <= 0.0f) return "off";
+    snprintf(buf, sz, "%.2fmm", (double)v);
+    return buf;
 }
 
 /* Find the analog interface of an analog-capable keyboard. Returns the fd
@@ -1603,6 +1716,16 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
              (double)cfg->analog.actuation_mm, (double)cfg->analog.release_mm,
              (double)cfg->analog.socd_depth_mm,
              cfg->analog.rt_enabled ? "on" : "off");
+    if (cfg->analog.rt_enabled) {
+        char pb[16], rb[16];
+        LOG_INFO("Rapid trigger: tapping press %.2fmm release %.2fmm | "
+                 "riding (anchor >= %.2fmm) press %s release %s",
+                 (double)cfg->analog.rt_press_mm,
+                 (double)cfg->analog.rt_release_mm,
+                 (double)cfg->analog.rt_deep_mm,
+                 fmt_reversal(pb, sizeof pb, cfg->analog.rt_deep_press_mm),
+                 fmt_reversal(rb, sizeof rb, cfg->analog.rt_deep_release_mm));
+    }
     return ad;
 }
 

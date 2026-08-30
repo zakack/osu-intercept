@@ -135,7 +135,10 @@ sections (search for the `/* --- */` banner comments):
    inferred from absence — `analog_drain` rebuilds the full depth of k1/k2
    each frame rather than tracking deltas. `analog_key_feed` is the per-key
    front-end: it turns depth into press/release edges using `actuation_mm`
-   plus a software rapid trigger. k1/k2 -> HID usage
+   plus a two-profile software rapid trigger — the anchor (`rt_extreme`)
+   against `rt_deep_mm` selects between `press_mm`/`release_mm` (tapping)
+   and `deep_press_mm`/`deep_release_mm` (riding), either of which may be
+   `off`. k1/k2 -> HID usage
    mapping is derived from the keyboard's own keymap via `EVIOCGKEYCODE_V2`
    (hid-input stores the HID usage as the scancode), not a hardcoded table.
 
@@ -203,6 +206,22 @@ down in reverse order.
   every press is emitted twice — once from evdev and once from analog.
 - `analog_key_feed` must keep `live` in sync with the edges it actually
   emits; `socd_apply` assumes strict press/release alternation per key.
+- The rapid-trigger profile is selected on the ANCHOR (`rt_extreme`), never
+  on the current depth and never on a latch. The anchor already carries the
+  right meaning on both sides: while `live` it is the deepest point of this
+  press ("did this press go deep"), while not `live` it is the shallowest
+  point since the release ("did the lift stay deep"). A latch such as `deep`
+  would strand a finger that dived once and then came up to tap without
+  fully releasing on a profile that emits nothing; the anchor recovers on
+  the next sample.
+- A zero `rt_deep_press_mm`/`rt_deep_release_mm` means that zone's edge is
+  DISABLED, not that any motion triggers it. The config parser rejects a
+  literal `0` and requires `off`, because the two readings are opposites.
+  With `deep_press_mm` off, `bottom_out_mm` is the only remaining re-press
+  and the config check refuses to let both be disabled.
+- The deep values are resolved from the tapping values in
+  `analog_config_resolve` before any validation, so everything downstream
+  reads concrete numbers and an unconfigured daemon runs one profile.
 - `analog_key_feed` decides edges on `actuation_mm`/`release_mm` and the
   rapid trigger ALONE. It does not inspect the other key at all; the only
   cross-key decision in the analog path lives in `analog_socd_edge`. An

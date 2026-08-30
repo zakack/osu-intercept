@@ -120,13 +120,26 @@ audio:
 #   socd_depth_mm: 3.0    # held key deeper than this -> SOCD engages
 #   rapid_trigger:
 #     enabled: true
-#     press_mm: 0.3       # downward reversal that re-presses
-#     release_mm: 0.3     # upward reversal that releases
+#     press_mm: 0.3       # downward reversal that re-presses  } tapping
+#     release_mm: 0.3     # upward reversal that releases      } zone
+#     deep_mm: 3.0        # at or past this the finger is RIDING, not
+#                         # tapping, and the deep_* values below apply
+#                         # instead. Unset follows socd_depth_mm.
+#     deep_press_mm: off  # riding-zone re-press. "off" means the backplate
+#                         # is the ONLY thing that re-presses - the setting
+#                         # Wootility will not let you express, and the one
+#                         # a rocking/wobble style wants. Unset mirrors
+#                         # press_mm.
+#     deep_release_mm: 0.3  # riding-zone release. "off" holds the key until
+#                         # a full release, which is how Keychron's bottom
+#                         # dead zone behaves - be aware it also means a
+#                         # wobble emits nothing, since the beats come from
+#                         # the release/re-press pair. Unset mirrors
+#                         # release_mm.
 #     bottom_out_mm: 0.1  # within this of full travel always presses, however
 #                         # small the down-travel - the mirror of a full
-#                         # release always releasing. Matters when press_mm is
-#                         # large and you ride the backplate as neutral.
-#                         # 0 disables.
+#                         # release always releasing. Load-bearing when
+#                         # deep_press_mm is off. 0 disables.
 #   hid_k1: auto          # HID usage ids; derived from the keyboard's own
 #   hid_k2: auto          # keymap unless pinned here (see -A)
 

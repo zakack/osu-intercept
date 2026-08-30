@@ -185,8 +185,31 @@ is deep, a press on the other is SOCD-managed however shallow it is.
 Rapid trigger follows the same shape as Wootility's: `press_mm` and
 `release_mm` are reversal distances, and — as with a full release always
 releasing — **bottoming out always presses**, however small the down-travel
-(`bottom_out_mm`). That matters if you set a large `press_mm` and treat the
-backplate as your neutral position when wobbling.
+(`bottom_out_mm`).
+
+Unlike Wootility's, it runs **two profiles**, because tapping and riding are
+different gestures that want different numbers. Which one applies is decided
+by the *anchor* — the point the finger last reversed at — against `deep_mm`:
+
+| anchor | profile | reads as |
+| --- | --- | --- |
+| shallower than `deep_mm` | `press_mm` / `release_mm` | you lifted out; this is a tap |
+| at or past `deep_mm` | `deep_press_mm` / `deep_release_mm` | you never left; this is a wobble |
+
+Selecting on the anchor rather than a latch means it self-corrects: lift out
+of the riding zone and the tapping profile applies on the very next sample.
+
+Either deep value may be `off`. **`deep_press_mm: off` makes the backplate
+the only thing that re-presses while you are riding** — no amount of
+down-travel alone will do it — which is the setting Wootility caps at 2.5 mm
+and never lets you reach. Tapping above `deep_mm` is unaffected, so ordinary
+rapid-trigger play still works in the same config. `deep_release_mm: off`
+is the mirror, holding the key until a full release the way Keychron's
+bottom dead zone does; note that a wobble then emits nothing at all, since
+its beats come from the release/re-press pair.
+
+Leave the deep values unset and they mirror the tapping ones, which is the
+single-profile behaviour you had before.
 
 Once a press reaches `socd_depth_mm` it stays eligible until the key returns
 all the way up past `release_mm`, so easing off mid-roll does not demote it
