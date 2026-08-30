@@ -78,30 +78,35 @@ audio:
 # past actuation, and a fixed-threshold toggle cannot tell that from a
 # deliberate press. Each misfire costs two spurious notes.
 #
-# socd_depth_mm decides when the SOCD state machine engages at all. When a
-# second key goes down while the key ALREADY HELD is riding deeper than
-# this, the toggle engages; otherwise the two keys stay fully independent
+# The wobble starts when BOTH keys are against the backplate at once.
+# Until then the two keys stay fully independent
 # and an incidental overlap costs nothing, which is what you want for
-# ordinary alternate tapping. Set it around where you actually ride the keys
-# when wobbling, so light tapping never engages it.
+# ordinary alternate tapping.
 #
-# Only the held key's depth is tested, deliberately. The key going down has
-# barely travelled at the moment its press fires, so requiring depth of it
-# too would make engagement depend on exactly where a rapid-trigger re-press
-# happens to land - reliable only while socd_depth_mm stays well above that,
-# and erratic as it approaches.
-#
-# Once engaged the toggle holds until neither key is deep any more, i.e.
+# Once engaged the toggle holds until a key comes all the way back up, i.e.
 # until the keys come back to the top. Rapid trigger lifting both virtual
 # keys mid-rock is part of the gesture, not the end of it, so it rides
 # straight through.
 #
-# Run `doubletapd -A` to watch live travel depth and pick numbers against
-# your own hands.
+# The wobble is a GESTURE, not a threshold: it starts when both keys are
+# against the backplate at once, and lasts until one of them comes all the
+# way back up past release_mm. Nothing else arms it. Where the backplate
+# starts is rapid_trigger.bottom_out_mm, which is therefore the single most
+# important number here.
 #
-# Once a press reaches socd_depth_mm it stays eligible until the key comes
-# all the way back up past release_mm, so easing off mid-roll does not
-# demote it. This mirrors Wootility's "Continuous Rapid Trigger".
+# It cannot tell a slider held on one key from a wobble starting on both -
+# at the instant the second key lands those are the same observation. What
+# it gives you instead is a trigger you can aim: the backplate is a hard
+# stop, so "don't bottom both keys at once" is something you can actually
+# do, unlike "don't cross some depth in the middle of travel".
+#
+# Rapid trigger then runs two profiles, picked by whether the wobble is
+# engaged - not by any depth. Riding uses deep_press_mm/deep_release_mm,
+# tapping uses press_mm/release_mm.
+#
+# Run `doubletapd -A` to watch live travel depth and pick numbers against
+# your own hands, or `doubletapd -T > s.csv` to record a session and replay
+# it offline (see the replay tool).
 #
 # Turn OFF the keyboard's own rapid trigger and SOCD (Snappy Tappy / Rappy
 # Snappy) in its configuration tool - the daemon does both itself here, and
@@ -111,44 +116,31 @@ audio:
 #   device: auto          # or an explicit /dev/hidrawN
 #   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
 #   actuation_mm: 1.0     # press threshold
-#   release_mm: 0.4       # full release; also clears the socd_depth latch.
+#   release_mm: 0.4       # full release; also ends the wobble.
 #                         # Keep it above the firmware's reporting floor
 #                         # (~0.05mm on a 60HE+) and below actuation_mm: a
 #                         # key held right at the floor reports a constant
 #                         # small depth instead of vanishing, and at exactly
 #                         # release_mm it would never count as released.
-#   socd_depth_mm: 3.0    # both keys deeper than this -> SOCD may engage
-#   engage: bottom        # what actually arms it once both are deep:
-#                         #   bottom - both keys against the backplate.
-#                         #     Immediate, and every wobble starts this way.
-#                         #     Bottoming both during normal play arms it
-#                         #     too, which is a rule you can follow.
-#                         #   rock   - both keys have moved since going
-#                         #     deep. A slider held on one key while the
-#                         #     other is tapped can never arm it, at the
-#                         #     cost of a beat at the start of a wobble.
 #   rapid_trigger:
 #     enabled: true
 #     press_mm: 0.3       # downward reversal that re-presses  } tapping
 #     release_mm: 0.3     # upward reversal that releases      } zone
-#     deep_mm: 3.0        # at or past this the finger is RIDING, not
-#                         # tapping, and the deep_* values below apply
-#                         # instead. Unset follows socd_depth_mm.
-#     deep_press_mm: off  # riding-zone re-press. "off" means the backplate
+#     deep_press_mm: off  # while the wobble is engaged. "off" means the backplate
 #                         # is the ONLY thing that re-presses - the setting
 #                         # Wootility will not let you express, and the one
 #                         # a rocking/wobble style wants. Unset mirrors
 #                         # press_mm.
-#     deep_release_mm: 0.3  # riding-zone release. "off" holds the key until
+#     deep_release_mm: 0.3  # while the wobble is engaged. "off" holds the key until
 #                         # a full release, which is how Keychron's bottom
 #                         # dead zone behaves - be aware it also means a
 #                         # wobble emits nothing, since the beats come from
 #                         # the release/re-press pair. Unset mirrors
 #                         # release_mm.
-#     bottom_out_mm: 0.1  # within this of full travel always presses, however
-#                         # small the down-travel - the mirror of a full
-#                         # release always releasing. Load-bearing when
-#                         # deep_press_mm is off. 0 disables.
+#     bottom_out_mm: 0.1  # where the backplate starts. Bottoming out always
+#                         # presses however small the down-travel, AND
+#                         # bottoming BOTH keys at once is what starts a
+#                         # wobble. Must be greater than 0.
 #   hid_k1: auto          # HID usage ids; derived from the keyboard's own
 #   hid_k2: auto          # keymap unless pinned here (see -A)
 

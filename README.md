@@ -141,7 +141,8 @@ uinput:
 
 # analog:             # only used by `socd: analog` — see below
 #   actuation_mm: 1.0
-#   socd_depth_mm: 1.5
+#   rapid_trigger:
+#     bottom_out_mm: 0.1
 ```
 
 After editing, restart the daemon:
@@ -162,91 +163,59 @@ fixed-threshold SOCD cleaner:
 > spurious notes (the steal, then the revert on the way back up) and
 > inverting which key is active for everything after it.
 
-`socd_depth_mm` decides **when the state machine engages at all**. When a
-second key goes down while the key *already held* is riding deeper than
-that, the toggle engages; otherwise the keys stay independent and an
-incidental overlap costs nothing — which is what you want for ordinary
-alternate tapping. Set it around where you actually ride the keys.
+The wobble is a **gesture**, not a threshold. It starts when **both keys
+are against the backplate at once**, and lasts until one of them comes all
+the way back up past `release_mm`. Nothing else arms it, so
+`rapid_trigger.bottom_out_mm` — which is where the backplate starts — is
+the most important number in the analog block.
 
-Only the **held** key's depth is tested. The key going down has barely
-travelled when its press fires, so requiring depth of it too would tie
-engagement to wherever a rapid-trigger re-press happens to land: reliable
-while `socd_depth_mm` sits well above that, erratic as it approaches.
+Until it engages the two keys are completely independent: ordinary
+alternate tapping, and even one key held deep while the other taps, are
+left alone entirely.
 
-Once engaged it holds until neither key is deep — until they come back to
-the top. It deliberately does **not** track the emitted keys, since rapid
-trigger lifts and re-presses those constantly and a moment where both are
-up is part of the rock, not the end of it.
-
-The SOCD engine only engages when both keys are past `socd_depth_mm` at the
-same time. Until then the two keys are completely independent, so:
-
-- **Both shallow** — ordinary alternate tapping, nothing to do with SOCD.
-- **One deep, one tapping** — the deep key is simply held while the other
-  taps. A real thing to want, and no longer mistaken for a misfire.
-- **Both deep** — the wobble. The toggle takes over and the rocking begins.
-
-Both keys deep is only the *precondition*. What actually arms the regime is
-set by `analog.engage`:
-
-| mode | trigger |
-| --- | --- |
-| `bottom` (default) | both keys against the backplate |
-| `rock` | both keys have produced a rapid-trigger edge since going deep |
-
-**`bottom` is immediate and aimable.** Every wobble begins with both fingers
-planted on the backplate, so it never misses one, and unlike a depth in the
-middle of travel it is a hard physical stop — you can hit it without
-proprioception, and "don't bottom both keys at once" is an instruction a
-player can actually follow.
-
-**`rock` waits for the gesture**, which buys a real guarantee: a slider held
-on one key while the other is tapped can never engage it, because only one
-finger is moving. The cost is that a wobble opens at the plain note rate
-until both fingers have moved, and that a slow deliberate gesture can fail
-to arm if a finger leaves the switch between beats.
-
-Neither can separate a slider from a wobble *at the instant the second key
-lands* — at that moment the two are the same observation, and the
-information distinguishing them does not exist yet. `rock` waits for it;
-`bottom` trades it for a rule you respect instead. Once armed, the regime
-rides through the constant lifting and re-pressing of a wobble, ending only
-when a finger actually leaves a switch.
+It deliberately does **not** distinguish a slider held on one key from a
+wobble starting on both. At the instant the second key reaches the floor
+those are the same observation — same depth, same velocity, same dwell —
+and the information separating them does not exist yet. What the backplate
+gives you instead is a trigger you can *aim*: it is a hard physical stop,
+so "don't bottom both keys at once" is an instruction you can actually
+follow, unlike "don't cross some depth in the middle of travel".
 
 Rapid trigger follows the same shape as Wootility's: `press_mm` and
 `release_mm` are reversal distances, and — as with a full release always
 releasing — **bottoming out always presses**, however small the down-travel
 (`bottom_out_mm`).
 
-Unlike Wootility's, it runs **two profiles**, because tapping and riding are
-different gestures that want different numbers. Which one applies is decided
-by the *anchor* — the point the finger last reversed at — against `deep_mm`:
+Unlike Wootility's, it runs **two profiles**, because tapping and riding
+are different gestures that want different numbers. Which one applies is
+decided by whether the wobble is engaged — not by any depth:
 
-| anchor | profile | reads as |
-| --- | --- | --- |
-| shallower than `deep_mm` | `press_mm` / `release_mm` | you lifted out; this is a tap |
-| at or past `deep_mm` | `deep_press_mm` / `deep_release_mm` | you never left; this is a wobble |
+| state | profile |
+| --- | --- |
+| not engaged | `press_mm` / `release_mm` |
+| engaged (riding) | `deep_press_mm` / `deep_release_mm` |
 
-Selecting on the anchor rather than a latch means it self-corrects: lift out
-of the riding zone and the tapping profile applies on the very next sample.
+Tying it to the gesture rather than a depth is what keeps beats even. An
+earlier version picked the profile from the anchor against a threshold, so
+a rock that overshot that line silently switched to the tapping profile and
+re-pressed part-way up instead of waiting for the backplate — the beat
+landed early on exactly the rocks that went high. Amplitude changing the
+rule is a limp, not a threshold.
 
 Either deep value may be `off`. **`deep_press_mm: off` makes the backplate
-the only thing that re-presses while you are riding** — no amount of
-down-travel alone will do it — which is the setting Wootility caps at 2.5 mm
-and never lets you reach. Tapping above `deep_mm` is unaffected, so ordinary
-rapid-trigger play still works in the same config. `deep_release_mm: off`
-is the mirror, holding the key until a full release the way Keychron's
-bottom dead zone does; note that a wobble then emits nothing at all, since
-its beats come from the release/re-press pair.
+the only thing that re-presses while riding** — no amount of down-travel
+alone will do it — which is the setting Wootility caps at 2.5 mm and never
+lets you reach. `deep_release_mm: off` is the mirror, holding the key until
+a full release the way Keychron's bottom dead zone does; note that a wobble
+then emits nothing at all, since its beats come from the release/re-press
+pair.
 
 Leave the deep values unset and they mirror the tapping ones, which is the
 single-profile behaviour you had before.
 
-Once a press reaches `socd_depth_mm` it stays eligible until the key returns
-all the way up past `release_mm`, so easing off mid-roll does not demote it
-— the same idea as Wootility's *Continuous Rapid Trigger*. A software rapid
-trigger comes along for the ride, since the daemon is computing actuation
-itself either way.
+Once a key has bottomed out it stays committed until it returns all the way
+up past `release_mm`, so easing off mid-roll does not demote it — the same
+idea as Wootility's *Continuous Rapid Trigger*.
 
 ### Recording and replaying a session
 
@@ -267,7 +236,8 @@ machine — it `#include`s `doubletapd.c` and stubs only the uinput writes, so
 it cannot drift from what the daemon actually does. It reports how many
 times the SOCD regime engaged, how many virtual presses were emitted, a
 histogram of how deep the keypresses actually went, and a sweep of
-engagements against `socd_depth_mm` so you can see where it reaches zero.
+engagements against `bottom_out_mm` so you can see how the backplate's
+width changes it.
 
 The depth histogram is the interesting part if you are wondering whether a
 given playstyle can trigger the regime at all: a player who never presses
@@ -283,8 +253,8 @@ doubletapd -A
 
 It prints live depth per key and the peak depth of each press, grabs
 nothing, and creates no virtual device — safe to run alongside a live
-daemon. Set `socd_depth_mm` comfortably below how deep you actually ride
-the keys and comfortably above an accidental dip.
+daemon. Set `bottom_out_mm` so the backplate starts just above where your
+fingers actually rest when riding.
 
 ### Requirements and caveats
 

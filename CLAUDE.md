@@ -142,9 +142,9 @@ sections (search for the `/* --- */` banner comments):
    each frame rather than tracking deltas. `analog_key_feed` is the per-key
    front-end: it turns depth into press/release edges using `actuation_mm`
    plus a two-profile software rapid trigger — the anchor (`rt_extreme`)
-   against `rt_deep_mm` selects between `press_mm`/`release_mm` (tapping)
-   and `deep_press_mm`/`deep_release_mm` (riding), either of which may be
-   `off`. k1/k2 -> HID usage
+   whose profile follows the regime — `press_mm`/`release_mm` while
+   tapping, `deep_press_mm`/`deep_release_mm` while riding, either of which
+   may be `off`. k1/k2 -> HID usage
    mapping is derived from the keyboard's own keymap via `EVIOCGKEYCODE_V2`
    (hid-input stores the HID usage as the scancode), not a hardcoded table.
 
@@ -191,40 +191,41 @@ down in reverse order.
   Adding a behavior to one path and not the other is almost always a bug.
   It takes the mode as an argument rather than reading `cfg->socd`, which is
   what lets the analog path run a shallow overlap as a plain remap.
-- Both keys past `socd_depth_mm` is only the PRECONDITION; `analog.engage`
-  picks the trigger. `bottom` (default) fires when both keys are against
-  the backplate — decided in `analog_regime_pre`, before the sample's
-  edges, so the arriving key's press runs under the toggle and takes over
-  at once (no churn: only one virtual key is down at that moment, the
-  completing press not yet applied). `rock` fires when BOTH keys have
-  produced a rapid-trigger edge since going deep — decided in
-  `analog_regime_post`, after the edges, so the triggering edge lands under
-  SOCD_OFF. You
-  engage by rocking, not by pressing both keys down. This is forced — at the
-  instant the second key reaches the floor, "slider held on k1, next circle
-  tapped on k2" and "finger parked on k1, wobble about to start" are
-  observationally identical in depth, velocity and dwell. Nothing evaluated
-  then can separate them; the information only appears afterwards. It must
-  be BOTH keys, because a key that was already deep also emits on its way
-  out (the departing rapid-trigger release) and a player double-tapping k2
-  against a held slider re-presses it without fully lifting — both are one
-  finger moving against a parked one. `was_deep` gates which edges count, so
-  the arriving key's own press cannot qualify. The `rocked[2]` latches clear
-  whenever the precondition lapses.
-- Superseded: engaging on both keys deep and both `live`. One key deep while the other taps is deliberately left
-  alone — the deep key is simply held while the other taps, which is a real
-  thing to want. Engagement is resolved once per sample in
-  `analog_regime_update`, called from `analog_drain` after both keys have
-  been fed and BEFORE that sample's edges are applied, so every edge runs
-  under the mode actually in force for it. It cannot live on the press edge:
-  that fires at `actuation_mm`, before the key has travelled, so the
-  incoming key is never deep at that instant.
-- Engagement tests `live`, the lapse does NOT. Rapid trigger lifts and
-  re-presses constantly, so a moment where one key is up is mid-rock, not
-  the end of the gesture; only `deep` clearing ends it. The asymmetry keeps
-  fast alternation out (a key tapped to the floor stays latched deep until
-  it clears `release_mm`, but its rapid-trigger release has already fired,
-  so it is not live) while letting an engaged wobble ride.
+- The wobble is a GESTURE, and the backplate defines it. It starts when
+  BOTH keys are bottomed at the same instant and ends when either stops
+  being committed. `deep` is that commitment latch: set when a `live` key
+  reaches `travel_mm - bottom_out_mm`, cleared only by rule 1 (a full
+  release past `release_mm`). So `bottom_out_mm` is load-bearing — it is
+  not merely a rapid-trigger corner case — and the config check refuses a
+  zero value.
+- It deliberately does NOT distinguish a slider held on one key from a
+  wobble starting on both. At the instant the second key reaches the floor
+  those are the same observation — same depth, velocity and dwell — and the
+  information separating them does not exist yet. Every attempt to find it
+  in one sample has failed and will; what the backplate buys instead is a
+  trigger a player can aim, being a hard physical stop. The harness asserts
+  this trade explicitly so it stays deliberate.
+- The regime is resolved once per sample in `analog_regime_update`, called
+  from `analog_drain` after both keys are fed and BEFORE that sample's
+  edges are applied. Both directions need that ordering: engaging first
+  lets the arriving key's press take over under the toggle immediately
+  (with no churn — only one virtual key is down at that point, the press
+  that completes the pair not yet applied), and lapsing first lets the
+  release that ends a wobble land as a plain release instead of being
+  reverted by a toggle on its way out.
+- The rapid-trigger profile is picked by the REGIME, never by a depth.
+  `analog_key_feed` takes it as an argument. An earlier revision selected
+  on the anchor against a threshold, which re-decided mid-gesture: a rock
+  that overshot the line silently switched to the tapping profile, so its
+  return stroke re-pressed after `press_mm` instead of waiting for the
+  backplate, and the beat landed early on exactly the rocks that went high.
+  Amplitude changing the rule is a limp, not a threshold. The regime lags
+  by one sample here and that is harmless — the sample that engages is a
+  press stroke, where no reversal test runs, and the sample that lapses is
+  a full release, which rule 1 handles before either profile matters.
+- The lapse does NOT test `live`. Rapid trigger lifts and re-presses the
+  emitted keys constantly, so a moment where one is up is mid-rock, not the
+  end of the gesture; only `deep` clearing ends it.
 - Changing regime under held fingers MUST reconcile the virtual keys, which
   is what `analog_regime_set` does: the two modes disagree about what should
   be down (OFF wants one virtual key per held physical key, the toggle wants
@@ -242,17 +243,16 @@ down in reverse order.
   picture would fire a SECOND note for the same departure. One beat per
   lift. The still-held key's virtual is left up until that key next moves,
   where the plain remap presses it again. No threshold fixes this: the rt
-  release always fires inside the deep zone, since `deep_release_mm` is
-  necessarily smaller than the gap between the floor and `socd_depth_mm`.
-  The only alternative is snappy release semantics, which halves the
-  wobble's note rate — a feel change, not a fix.
+  release fires within `deep_release_mm` of the floor, while the regime
+  lasts until the key clears `release_mm`, so a departing finger is always
+  still inside it when that edge lands. The only alternative is snappy
+  release semantics, which halves the wobble's note rate — a feel change,
+  not a fix.
 - Engagement must never be evaluated at a press edge, however tempting. The
   edge fires at `actuation_mm` or at a rapid-trigger reversal, before the
-  key has travelled, so any test of the incoming key's depth there hinges on
-  where re-presses happen to land relative to `socd_depth_mm` — stable only
-  while the threshold sits above them, a coin flip as it approaches. The
-  per-sample check exists precisely so the second key can cross the line on
-  its own schedule, emitting nothing.
+  key has travelled, so any test of the incoming key's depth there hinges
+  on where re-presses happen to land. The per-sample check exists precisely
+  so the second key can reach the backplate on its own schedule.
 - Gating the *emission* of a press is not a substitute for gating the
   regime: two presses that both reach `socd_apply` still trigger the toggle,
   which is what turns an incidental overlap into an extra keypress.

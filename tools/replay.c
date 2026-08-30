@@ -115,15 +115,13 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
         int   was = ad.regime;
         g_now_us = tr->f[i].us;
 
-        int was_deep[2] = { ad.keys.key[0].deep, ad.keys.key[1].deep };
         for (int k = 0; k < 2; k++)
             ne[k] = analog_key_feed(&ad.keys, k, tr->f[i].mm[k],
-                                    &cfg->analog, edges[k]);
-        analog_regime_pre(&ad, cfg, tr->f[i].mm);
+                                    &cfg->analog, ad.regime, edges[k]);
+        analog_regime_update(&ad, cfg, tr->f[i].mm);
         for (int k = 0; k < 2; k++)
             for (int e = 0; e < ne[k]; e++)
                 analog_socd_edge(&ad, k == 0, edges[k][e], cfg);
-        analog_regime_post(&ad, cfg, was_deep, ne);
 
         if (!was && ad.regime) {
             g_run.engagements++;
@@ -187,13 +185,15 @@ static void report_style(const trace_t *tr, const oid_config_t *cfg) {
         printf("  %4.2f-%4.2fmm %5u |%.*s%*s|%s\n",
                (double)lo, (double)hi, bucket[b], w,
                "############################################", 44 - w, "",
-               (lo <= cfg->analog.socd_depth_mm &&
-                cfg->analog.socd_depth_mm < hi) ? "  <- socd_depth" : "");
+               (lo <= travel - cfg->analog.bottom_out_mm &&
+                travel - cfg->analog.bottom_out_mm < hi)
+                   ? "  <- backplate" : "");
     }
-    printf("  mean peak %.2fmm, deepest %.2fmm, socd_depth %.2fmm (%.0f%% "
-           "of travel)\n",
-           sum / npress, deepest, (double)cfg->analog.socd_depth_mm,
-           (double)cfg->analog.socd_depth_mm / travel * 100.0);
+    printf("  mean peak %.2fmm, deepest %.2fmm, backplate at %.2fmm "
+           "(%.0f%% of travel)\n",
+           sum / npress, deepest,
+           (double)(travel - cfg->analog.bottom_out_mm),
+           (double)(travel - cfg->analog.bottom_out_mm) / travel * 100.0);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -252,20 +252,18 @@ int main(int argc, char **argv) {
     report_style(&tr, &cfg);
 
     if (sweep) {
-        printf("\nengagements vs socd_depth_mm (deep_mm follows it)\n");
-        float keep_socd = cfg.analog.socd_depth_mm;
-        float keep_deep = cfg.analog.rt_deep_mm;
-        int   linked    = (keep_deep == keep_socd);
-        for (int i = 4; i <= 20; i++) {
-            float d = cfg.analog.travel_mm * (float)i / 20.0f;
-            cfg.analog.socd_depth_mm = d;
-            if (linked) cfg.analog.rt_deep_mm = d;
+        printf("\nengagements vs bottom_out_mm (where the backplate starts)\n");
+        float keep = cfg.analog.bottom_out_mm;
+        static const float bo[] = { 0.02f, 0.05f, 0.08f, 0.10f, 0.15f,
+                                    0.20f, 0.30f, 0.50f, 0.80f };
+        for (size_t i = 0; i < sizeof(bo) / sizeof(bo[0]); i++) {
+            cfg.analog.bottom_out_mm = bo[i];
             replay_run(&tr, &cfg, &r);
-            printf("  %5.2fmm (%3.0f%% of travel)  %5u engagements\n",
-                   (double)d, (double)i * 5.0, r.engagements);
+            printf("  %4.2fmm  (backplate at %5.2fmm)  %5u engagements\n",
+                   (double)bo[i],
+                   (double)(cfg.analog.travel_mm - bo[i]), r.engagements);
         }
-        cfg.analog.socd_depth_mm = keep_socd;
-        cfg.analog.rt_deep_mm    = keep_deep;
+        cfg.analog.bottom_out_mm = keep;
     }
 
     free(tr.f);
