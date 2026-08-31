@@ -19,7 +19,7 @@ single uinput virtual keyboard. It also plays a click sound via PipeWire on
 every virtual keypress. Built for rhythm games (osu!) where fast key
 alternation needs a "rocking" input pattern instead of naive SOCD handling.
 
-The entire implementation lives in `doubletapd.c` (~2450 lines) — there is
+The entire implementation lives in `doubletapd.c` (~2850 lines) — there is
 no multi-module structure.
 
 ## Build
@@ -71,6 +71,10 @@ consumes it — built on demand with `cmake --build build --target replay`,
 excluded from `all`, and NOT installed. It `#include`s `doubletapd.c` and
 stubs only the uinput writes, so it exercises the daemon's real state
 machine rather than a copy that could drift; keep it that way.
+`tools/regimetest.c` is the same trick as a unit test — assertions over the
+`deep` latch and its mode transitions, run with `./build/regimetest`. Both
+tools build as part of `all`, deliberately: they `#include doubletapd.c`, and
+that guarantee is worthless if the binaries can go stale.
 
 ## Architecture
 
@@ -142,9 +146,12 @@ sections (search for the `/* --- */` banner comments):
    each frame rather than tracking deltas. `analog_key_feed` is the per-key
    front-end: it turns depth into press/release edges using `actuation_mm`
    plus a two-profile software rapid trigger — the anchor (`rt_extreme`)
-   whose profile follows the regime — `press_mm`/`release_mm` while
+   whose profile follows the `deep` latch — `press_mm`/`release_mm` while
    tapping, `deep_press_mm`/`deep_release_mm` while riding, either of which
-   may be `off`. k1/k2 -> HID usage
+   may be `off`. `analog_deep_update` owns the latch (arm: both keys on the
+   backplate in one report; disarm: either key back above `actuation_mm`),
+   and `analog_deep_set` reconciles the virtual keys across the mode change.
+   k1/k2 -> HID usage
    mapping is derived from the keyboard's own keymap via `EVIOCGKEYCODE_V2`
    (hid-input stores the HID usage as the scancode), not a hardcoded table.
 
@@ -191,75 +198,100 @@ down in reverse order.
   Adding a behavior to one path and not the other is almost always a bug.
   It takes the mode as an argument rather than reading `cfg->socd`, which is
   what lets the analog path run a shallow overlap as a plain remap.
-- The wobble is a GESTURE, and the backplate defines it. It starts when
-  BOTH keys are bottomed at the same instant and ends when either stops
-  being committed. `deep` is that commitment latch: set when a `live` key
-  reaches `travel_mm - bottom_out_mm`, cleared only by rule 1 (a full
-  release past `release_mm`). So `bottom_out_mm` is load-bearing — it is
-  not merely a rapid-trigger corner case — and the config check refuses a
-  zero value.
-- It deliberately does NOT distinguish a slider held on one key from a
-  wobble starting on both. At the instant the second key reaches the floor
-  those are the same observation — same depth, velocity and dwell — and the
-  information separating them does not exist yet. Every attempt to find it
-  in one sample has failed and will; what the backplate buys instead is a
-  trigger a player can aim, being a hard physical stop. The harness asserts
-  this trade explicitly so it stays deliberate.
-- The regime is resolved once per sample in `analog_regime_update`, called
-  from `analog_drain` after both keys are fed and BEFORE that sample's
-  edges are applied. Both directions need that ordering: engaging first
-  lets the arriving key's press take over under the toggle immediately
-  (with no churn — only one virtual key is down at that point, the press
-  that completes the pair not yet applied), and lapsing first lets the
-  release that ends a wobble land as a plain release instead of being
-  reverted by a toggle on its way out.
-- The rapid-trigger profile is picked by the REGIME, never by a depth.
+- The `deep` latch is the ONLY thing that selects between the two modes,
+  and both halves of its rule are pure depth tests on the CURRENT sample:
+  it ARMS when both keys are at `travel_mm - bottom_out_mm`, and DISARMS
+  when either falls below `actuation_mm`. No per-key commitment latch, no
+  counter, no comparison of one key's depth against the other's.
+- The failure being fixed is ALT-TAPPING OVERLAP, not a resting finger.
+  At speed, alternating taps overlap in the middle of travel; a plain
+  toggle reads that as a rock and answers the outgoing key's release by
+  re-pressing its virtual key — a note nobody struck. What makes the latch
+  work is that alt-tapping never puts both keys on the floor in the same
+  report, because its defining shape is one finger leaving as the other
+  arrives. `tools/regimetest.c` case B asserts exactly this.
+- One key held deep while the other is lightly pressed or tapped is NOT a
+  failure mode and never was. Two earlier branches
+  (`feature/analog-input`, `feature/analog-split-rt`) were built around
+  solving it — relative-depth gates, absolute-depth gates, five successive
+  reformulations of "what arms the regime" — and were abandoned for it.
+  Do not reintroduce a depth-comparison gate between k1 and k2.
+- `bottom_out_mm` is load-bearing and serves two roles by deliberate
+  choice: the rapid-trigger bottom-out line AND the latch threshold. The
+  config check refuses a zero value and warns above 10% of travel, where a
+  firm tap starts to reach it and alt-tapping could arm the latch.
+- `actuation_mm` disarming the latch is why the config check requires it to
+  sit above the backplate: an actuation line at or below the backplate
+  would disarm the latch on the very sample it armed.
+- The latch is resolved once per sample in `analog_deep_update`, called from
+  `analog_drain` after both keys are fed and BEFORE that sample's edges are
+  applied. Both directions need that ordering: arming first lets the
+  arriving key's press take over under the toggle immediately, and
+  disarming first lets the release that ends a rock land as a plain release
+  instead of being reverted by a toggle on its way out.
+- The rapid-trigger profile is picked by the LATCH, never by a depth.
   `analog_key_feed` takes it as an argument. An earlier revision selected
   on the anchor against a threshold, which re-decided mid-gesture: a rock
   that overshot the line silently switched to the tapping profile, so its
   return stroke re-pressed after `press_mm` instead of waiting for the
   backplate, and the beat landed early on exactly the rocks that went high.
-  Amplitude changing the rule is a limp, not a threshold. The regime lags
-  by one sample here and that is harmless — the sample that engages is a
-  press stroke, where no reversal test runs, and the sample that lapses is
-  a full release, which rule 1 handles before either profile matters.
-- The lapse does NOT test `live`. Rapid trigger lifts and re-presses the
-  emitted keys constantly, so a moment where one is up is mid-rock, not the
-  end of the gesture; only `deep` clearing ends it.
-- Changing regime under held fingers MUST reconcile the virtual keys, which
-  is what `analog_regime_set` does: the two modes disagree about what should
-  be down (OFF wants one virtual key per held physical key, the toggle wants
-  exactly one), and flipping the flag without settling that strands a key.
-  The current picture comes from `socd`, which reflects edges already
+  Amplitude changing the rule is a limp, not a threshold. The latch lags by
+  one sample here and that is harmless — the sample that arms it is a press
+  stroke, where no reversal test runs, and the sample that disarms it is a
+  key on its way out whose next sample runs the tapping profile anyway.
+- Changing the latch under held fingers MUST reconcile the virtual keys,
+  which is what `analog_deep_set` does: the two modes disagree about what
+  should be down (OFF wants one virtual key per held physical key, the
+  toggle wants exactly one), and flipping the flag without settling that
+  strands a key. Disarming at `actuation_mm` makes this ROUTINE rather than
+  a corner — a finger can still be resting well down on a key when the mode
+  flips. The current picture comes from `socd`, which reflects edges already
   APPLIED; the target picture comes from the front-end's `live`, which is
   this sample's truth. Using `socd` for the target presses a key for a
   finger that left on this very sample and releases it again when the edge
-  lands — a phantom note on the way out of a wobble.
-- Reconciliation emits BOTH releases and presses. It must: on lapse,
-  SOCD_OFF wants a virtual key down for every held physical key, and a
-  release-only reconciliation strands the survivor — it leaves the still-held
-  key with no virtual key down and NO WAY TO RECOVER, because
-  `analog_key_feed` still has it `live` and so only ever runs the release
-  check for it. The desync then persists until that key is fully released
-  and pressed again. A trace of a real wobble triple caught this: the
-  gesture ended with a key on the backplate and nothing held.
-  The cost is a second note when lifting out of a wobble — the toggle's
-  revert fires on the departing key's rapid-trigger release, and the lapse
-  then has to correct it. Both are unavoidable without knowing the future:
-  at the moment of the revert, a rock and a departure look identical. The
-  only way to have neither is snappy release semantics, where a release
-  reverts only when the ACTIVE key lifts; that costs half the wobble's note
-  rate, which is a feel change rather than a fix.
-- Engagement must never be evaluated at a press edge, however tempting. The
+  lands — a phantom note on the way out of a rock.
+- Reconciliation emits BOTH releases and presses, and which direction it
+  runs in falls out of the diff. ARMING is release-only by construction
+  (OFF's two keys down -> the toggle's one), which is what makes arming
+  silent — no press, no click. DISARMING may press: SOCD_OFF wants the
+  still-held key's virtual back down, and a release-only reconciliation
+  strands the survivor — it leaves the still-held key with no virtual key
+  down and NO WAY TO RECOVER, because `analog_key_feed` still has it `live`
+  and so only ever runs the release check for it. The cost is a second note
+  when lifting out of a rock; that is the cheaper of the two mistakes.
+- `act` is bound LAZILY, by the first key to dip out of the latch — see
+  `act_bound` in `analog_socd_edge`. At the instant the latch arms both keys
+  are on the floor and nothing yet says which finger is leaving, so any
+  choice made there is a guess, and guessing wrong presses the virtual key
+  of the finger already on its way up. The first edge after arming is
+  necessarily a release (both keys are live, and a live key can only
+  release), which is exactly the event that answers the question. What
+  `last_press` picks at arming time is only which virtual key SURVIVES, not
+  `act`.
+- The `S_RELEASE` transition at the first dip needs no forcing. Both keys
+  are still tracked as held (`SOCD_OFF` maintains `socd.k1`/`k2` too), so
+  `state == k1 + k2 + value == 1` computes it in the existing machine.
+- `analog_socd_edge` GATES THE CLICK on the virtual picture actually
+  changing, diffing `socd_virtual_state` either side of `socd_apply`. When
+  the first key to dip is the one whose virtual stepped aside at arming,
+  the toggle's revert is two no-change writes the kernel drops, yet
+  `socd_apply` still reports a voice — that click would be a beat you hear
+  with nothing behind it, and the note for that key already landed under
+  SOCD_OFF when it bottomed. The `before` snapshot MUST be taken before the
+  `act` binding: `act` is what names the virtual keys, so binding first
+  makes the snapshot describe the picture for the NEW act, which is the
+  inverse of reality in exactly the case the gate exists for.
+- Arming must never be evaluated at a press edge, however tempting. The
   edge fires at `actuation_mm` or at a rapid-trigger reversal, before the
   key has travelled, so any test of the incoming key's depth there hinges
   on where re-presses happen to land. The per-sample check exists precisely
   so the second key can reach the backplate on its own schedule.
 - Gating the *emission* of a press is not a substitute for gating the
-  regime: two presses that both reach `socd_apply` still trigger the toggle,
+  mode: two presses that both reach `socd_apply` still trigger the toggle,
   which is what turns an incidental overlap into an extra keypress.
-- Regime state keys off `deep` and `live`, NOT off `socd.k1`/`socd.k2`.
-  Those track edges already applied and lag the front-end by a sample.
+- Latch state keys off the sample's depths and `live`, NOT off
+  `socd.k1`/`socd.k2`. Those track edges already applied and lag the
+  front-end by a sample.
 - In analog mode the digital k1/k2 of the analog keyboard MUST be dropped
   (`in->analog`, set by matching vendor/product in `input_try_open`), or
   every press is emitted twice — once from evdev and once from analog.
@@ -283,11 +315,9 @@ down in reverse order.
   rapid trigger ALONE. It does not inspect the other key at all; the only
   cross-key decision in the analog path lives in `analog_socd_edge`. An
   earlier revision gated presses on the other key's depth to filter a
-  resting finger's dip — that filtered on depth, but a deliberate wobble and
-  an incidental overlap during alternate tapping are identical in depth, so
-  it could not separate them. Anything reaching for that problem again wants
-  direction or dwell, not a depth threshold, and belongs in
-  `analog_socd_edge` where the regime is decided.
+  resting finger's dip. That was solving a non-problem, and it filtered on
+  depth, where a deliberate rock and an incidental overlap are identical.
+  Do not bring it back.
 
 ## Key invariants to preserve when editing `process_event`
 

@@ -6,11 +6,18 @@
  * every keyboard-shaped device that advertises both configured keys
  * (with inotify-driven hotplug either way) - applies a SOCD state
  * machine ("toggle"/"on" = last-input + reverting toggle, "snappy" =
- * last input wins, or "off" = plain remap with no cleaning, per the
- * config's socd field) to two configurable physical
+ * last input wins, "analog" = toggle and off switched at runtime by how
+ * far the keys are pressed, or "off" = plain remap with no cleaning, per
+ * the config's socd field) to two configurable physical
  * keys (k1, k2 -> v1, v2), mirrors every other event verbatim into a
  * single uinput virtual keyboard, and plays a click sound through
  * PipeWire on every virtual key-press.
+ *
+ * In analog mode the keyboard's travel depth is read straight off its
+ * vendor HID interface and the `deep` latch decides which machine is in
+ * force: it arms when BOTH keys are on the backplate in one report (that
+ * is a rock) and disarms when either comes back up past actuation (that
+ * is tapping). See analog_deep_update.
  *
  * Copyright 2026 Zachary Kessler
  */
@@ -454,22 +461,24 @@ typedef struct {
                            * subtraction that suits one end goes negative at
                            * the other. */
     /* bottom_out_mm defines the backplate, and the backplate is the whole
-     * gesture: bottoming both keys at once starts a wobble, and a key
-     * counts as committed to one from the moment it bottoms until it comes
-     * all the way back up past release_mm. */
+     * gesture: both keys on it at once is what arms `deep` and hands k1/k2
+     * to the toggle. It does double duty as the rapid-trigger bottom-out
+     * line, deliberately - one number, so there is one place to tune how
+     * far down "planted" means. */
     int    rt_enabled;
     float  rt_press_mm;   /* downward reversal that re-presses */
     float  rt_release_mm; /* upward reversal that releases */
-    /* Rapid trigger runs two profiles, picked by whether the wobble is
-     * engaged: riding uses the deep pair, tapping the plain one. A
+    /* Rapid trigger runs two profiles, picked by whether the `deep` latch
+     * is armed: riding uses the deep pair, tapping the plain one. A
      * negative value means "unset"; analog_config_resolve fills it from
      * the tapping value, so an unconfigured daemon runs one profile.
      * 0 means the edge is disabled while riding. */
     float  rt_deep_press_mm;   /* riding re-press; 0 == bottom-out only */
     float  rt_deep_release_mm; /* riding release; 0 == holds until full
                                 * release (Keychron's bottom dead zone) */
-    float  bottom_out_mm; /* within this of full travel == bottomed out, which
-                           * presses regardless of rt_press_mm; 0 disables */
+    float  bottom_out_mm; /* within this of full travel == bottomed out:
+                           * presses regardless of rt_press_mm, and, for
+                           * both keys at once, arms `deep` */
     int    hid_k1;        /* HID usage override; -1 == derive from the keymap */
     int    hid_k2;
 } analog_config_t;
@@ -508,7 +517,7 @@ static void config_init(oid_config_t *c) {
     c->analog.rt_release_mm = 0.3f;
     c->analog.rt_deep_press_mm   = -1.0f;   /* unset: mirror rt_press_mm   */
     c->analog.rt_deep_release_mm = -1.0f;   /* unset: mirror rt_release_mm */
-    c->analog.bottom_out_mm = 0.05f;
+    c->analog.bottom_out_mm = 0.20f;  /* 95% of the 4mm default travel */
     c->analog.hid_k1        = -1;   /* sentinel: derive from the keymap */
     c->analog.hid_k2        = -1;
 }
@@ -641,14 +650,16 @@ static int analog_config_check(const analog_config_t *a) {
      * a rapid-trigger corner case. */
     if (a->bottom_out_mm <= 0.0f) {
         LOG_ERR("'analog.rapid_trigger.bottom_out_mm' must be greater than "
-                "0: it defines where the backplate starts, and bottoming "
-                "both keys is what starts a wobble");
+                "0: it defines where the backplate starts, and both keys "
+                "reaching it is what arms the deep latch");
         bad = 1;
     }
-    /* Actuation has to sit above the backplate, or a key reaches the floor
-     * without ever registering as pressed: it could never latch as
-     * committed, so the wobble could never start, and with actuation past
-     * travel_mm it could never actuate at all. Both are silent bricks. */
+    /* Actuation has to sit above the backplate, and the deep latch makes
+     * this load-bearing rather than merely tidy: actuation_mm is what
+     * DISARMS the latch, so an actuation line at or below the backplate
+     * would disarm it on the very sample it armed, and with actuation past
+     * travel_mm the key could never actuate at all. Both are silent
+     * bricks. */
     if (a->travel_mm > 0.0f && a->bottom_out_mm > 0.0f &&
         a->actuation_mm >= a->travel_mm - a->bottom_out_mm) {
         LOG_ERR("'analog.actuation_mm' (%.3f) must be shallower than the "
@@ -685,6 +696,17 @@ static int analog_config_check(const analog_config_t *a) {
         LOG_WARN("'analog.rapid_trigger.bottom_out_mm' (%.3f) >= travel_mm "
                  "(%.3f): every sample counts as bottomed out",
                  (double)a->bottom_out_mm, (double)a->travel_mm);
+    /* A backplate under 90% of travel is reachable by a firm tap, and a tap
+     * that reaches it is a tap that can arm the latch - which is exactly the
+     * alt-tapping misfire the latch exists to avoid. */
+    if (a->travel_mm > 0.0f && a->bottom_out_mm > 0.10f * a->travel_mm)
+        LOG_WARN("'analog.rapid_trigger.bottom_out_mm' (%.3f) puts the "
+                 "backplate at %.1f%% of travel: below ~90%% a firm tap can "
+                 "reach it, and two overlapping taps could arm the deep "
+                 "latch. Record a session with -T and check it with `replay`",
+                 (double)a->bottom_out_mm,
+                 (double)((a->travel_mm - a->bottom_out_mm)
+                          / a->travel_mm * 100.0f));
     return 0;
 }
 
@@ -862,8 +884,9 @@ static int load_config(const char *path, oid_config_t *c) {
             map_get(&doc, an, "release_mm"))
             LOG_WARN("'analog.gate', 'gate_depth_mm', 'gate_margin_mm', "
                      "'socd_depth_mm', 'engage' and 'release_mm' were "
-                     "removed and are ignored - the backplate defines the "
-                     "gesture, and release follows actuation");
+                     "removed and are ignored - both keys reaching the "
+                     "backplate is what arms the deep latch, and release "
+                     "follows actuation");
 
         yaml_node_t *rt = map_get(&doc, an, "rapid_trigger");
         if (rt) {
@@ -1415,17 +1438,13 @@ static int analog_decode(int fmt, const unsigned char *buf, size_t len,
  * Two thresholds instead of one is the whole feature, but they answer
  * different questions. actuation_mm means "this is a keypress" and is the
  * only thing that decides whether an edge is emitted here. The backplate
- * (travel_mm - bottom_out_mm) means "this key is committed"; it gates
- * nothing in this function - it only sets the `deep` latch that
- * analog_regime_update reads when deciding whether a wobble is under way.
+ * (travel_mm - bottom_out_mm) means "this key is against the floor", and
+ * this function uses it for one thing only: the bottom-out re-press rule.
+ * Whether the PAIR of keys is on the floor is analog_deep_update's
+ * business, and it reads the two depths directly rather than any latch
+ * kept here - which is why this struct holds no commitment flag.
  *
- * `deep` is a latch, deliberately not the same as "currently bottomed":
- * once a press has reached the backplate it stays committed even as it
- * bounces during normal riding, and lets go only on a full release past
- * release_mm. That is the same contract as
- * Wootility's "Continuous Rapid Trigger" - tracking stays engaged until
- * the key returns to the top, not merely until it recrosses a threshold.
- * `rt_extreme` follows the same continuity rule: a rapid-trigger release
+ * `rt_extreme` is continuous across rapid-trigger edges: a rapid-trigger release
  * does not zero it, so a micro-reversal re-press measures its travel from
  * the right anchor rather than a stale actuation point. Since every path
  * that sets `live` also anchors `rt_extreme` to a real sample depth
@@ -1446,11 +1465,6 @@ static int analog_decode(int fmt, const unsigned char *buf, size_t len,
  *      fresh-actuation logic.
  *   3. Otherwise (never actuated this engagement) the fresh-actuation
  *      check runs instead.
- *   4. Finally, independent of which of 2/3 fired, the commitment latch
- *      is evaluated once against the sample's resulting `live`/depth - so
- *      a sample that reaches the backplate on the same tick it went live
- *      latches immediately, while one that reaches it on the same tick it
- *      went non-live (a rapid-trigger release) correctly does not.
  *
  * Every branch that flips `live` is the branch that appends the matching
  * edge, so `live` cannot desynchronize from what was emitted - socd_apply
@@ -1458,7 +1472,6 @@ static int analog_decode(int fmt, const unsigned char *buf, size_t len,
  */
 typedef struct {
     int   live;        /* an edge has been emitted; key counts as pressed */
-    int   deep;        /* latched: bottomed out during this press */
     float rt_extreme;  /* local extreme for rapid trigger, mm */
 } analog_key_t;
 
@@ -1476,19 +1489,18 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
     analog_key_t *self = &st->key[idx];
     int           n    = 0;
 
-    /* 1. Full release: master reset. The only place that clears `deep`
-     * or zeroes `rt_extreme`. */
+    /* 1. Full release: master reset. The only place that zeroes
+     * `rt_extreme`. */
     if (depth_mm < cfg->release_mm) {
         if (self->live)
             out[n++] = 0;
         self->live       = 0;
-        self->deep       = 0;
         self->rt_extreme = 0.0f;
         return n;
     }
 
     /* Which rapid-trigger profile this sample runs under: the caller
-     * passes the regime, because the regime is the gesture.
+     * passes `deep`, because the latch is the gesture.
      *
      * An earlier revision picked the profile from the anchor against a
      * depth. That re-decided mid-gesture: a rock that overshot the line
@@ -1497,16 +1509,18 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
      * backplate, and the beat landed early on exactly the rocks that went
      * high. Amplitude changing the rule is a limp, not a threshold.
      *
-     * The regime already knows. Riding starts when both keys bottom out
-     * and ends when a finger leaves the switch, so it is lagged by one
-     * sample here and that is harmless: the sample that engages is a press
-     * stroke, where no reversal test runs, and the sample that lapses is a
-     * full release, which rule 1 handles before either profile matters. */
+     * `deep` already knows. It arms when both keys are on the floor and
+     * disarms when either comes back past actuation_mm, so it is lagged by
+     * one sample here and that is harmless: the sample that arms it is a
+     * press stroke, where no reversal test runs, and the sample that
+     * disarms it is a key on its way out whose next sample runs the
+     * tapping profile anyway. */
     float press   = riding ? cfg->rt_deep_press_mm   : cfg->rt_press_mm;
     float release = riding ? cfg->rt_deep_release_mm : cfg->rt_release_mm;
 
-    /* Against the backplate. This is both the re-press rule below and the
-     * definition of a committed key: rule 4 latches `deep` here. */
+    /* Against the backplate: the re-press rule below. The same line is
+     * what analog_deep_update tests for BOTH keys at once, but it reads
+     * the depths itself - nothing about the pair is decided here. */
     int bottomed = depth_mm >= cfg->travel_mm - cfg->bottom_out_mm;
 
     if (cfg->rt_enabled && self->rt_extreme != 0.0f) {
@@ -1529,7 +1543,7 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
              * release always releases however small the up-travel. Riding
              * the backplate as the neutral position depends on this: with a
              * large press distance - or with deep_press_mm off, where the
-             * backplate is the ONLY thing that re-presses - a wobble that
+             * backplate is the ONLY thing that re-presses - a rock that
              * ends against the bottom never travels far enough to satisfy
              * the reversal test on its own. */
             /* A re-press still has to clear actuation_mm: without that
@@ -1553,14 +1567,6 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
         self->rt_extreme = depth_mm;
         out[n++]         = 1;
     }
-
-    /* 4. Commitment latch, evaluated once against the outcome of 2/3.
-     * A key is committed from the moment it reaches the backplate until it
-     * comes all the way back up past release_mm - rule 1 is the only place
-     * that clears it. Both keys committed AND both currently bottomed is
-     * what starts a wobble; either one un-committing ends it. */
-    if (self->live && bottomed)
-        self->deep = 1;
 
     return n;
 }
@@ -1702,10 +1708,15 @@ typedef struct {
     char           path[PATH_MAX];
     analog_state_t keys;
     socd_state_t   socd;
-    int            regime;      /* 1 == this overlap is SOCD-managed */
+    int            deep;        /* 1 == both keys planted on the backplate;
+                                 * k1/k2 run the toggle instead of the
+                                 * plain remap. See analog_deep_update. */
+    int            act_bound;   /* 1 == socd.act has been bound to the key
+                                 * that dipped first out of this latch.
+                                 * Cleared on every latch change. */
     int            last_press;  /* 0 == k1, 1 == k2: most recent press edge.
                                  * Picks which key keeps its virtual on when
-                                 * the regime engages with both already
+                                 * the latch arms with both already
                                  * down - last input wins. */
 } analog_dev_t;
 
@@ -1754,7 +1765,9 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
              (double)cfg->analog.actuation_mm, (double)cfg->analog.release_mm,
              (double)(cfg->analog.travel_mm - cfg->analog.bottom_out_mm),
              cfg->analog.rt_enabled ? "on" : "off");
-    LOG_INFO("SOCD rides while both keys are committed to the backplate");
+    LOG_INFO("SOCD engages while both keys are planted on the backplate "
+             "(deep latch); disengages when either passes %.2fmm on the "
+             "way up", (double)cfg->analog.actuation_mm);
     if (cfg->analog.rt_enabled) {
         char pb[16], rb[16];
         LOG_INFO("Rapid trigger: tapping press %.2fmm release %.2fmm | "
@@ -2194,8 +2207,8 @@ static int drain_device(input_dev_t *in, const oid_config_t *cfg) {
 /* Which virtual keys `mode` would be holding down, given which physical
  * keys `held` says are down. SOCD_OFF mirrors one-to-one; the toggle holds
  * exactly one - the `act` one - whenever anything at all is held. Used to
- * diff the two modes against each other when the regime changes under held
- * fingers. */
+ * diff the two modes against each other when the `deep` latch changes
+ * under held fingers. */
 static void socd_virtual_state(const int *held, int act, int mode,
                                int *down) {
     down[0] = down[1] = 0;
@@ -2207,7 +2220,7 @@ static void socd_virtual_state(const int *held, int act, int mode,
     }
 }
 
-/* Switch the regime on or off, reconciling the virtual keys as we go.
+/* Arm or disarm the `deep` latch, reconciling the virtual keys as we go.
  *
  * The two modes disagree about what should be held: OFF wants a virtual key
  * per held physical key, the toggle wants exactly one. Flipping the flag
@@ -2217,50 +2230,54 @@ static void socd_virtual_state(const int *held, int act, int mode,
  * toggle pressed is never released. So compute both pictures and emit the
  * difference.
  *
- * Engaging with both keys already down (the second one having gone deep
- * while its virtual key was on from the plain-remap path) means one of them
- * has to let go. The most recently pressed key keeps it: last input wins,
- * the same principle the core runs on. */
-static void analog_regime_set(analog_dev_t *ad, int on,
-                              const oid_config_t *cfg) {
+ * That matters MORE than it did when the latch cleared at release_mm:
+ * disarming at actuation_mm means the mode can flip with a finger still
+ * resting well down on a key, so a mode change under held fingers is
+ * routine rather than a corner.
+ *
+ * Arming with both keys already down - which is always, since arming means
+ * both are on the floor and the plain remap has pressed both - means one of
+ * them has to let go. The most recently pressed key keeps it: last input
+ * wins, the same principle the core runs on. Which one keeps it does NOT
+ * decide `act`; see analog_socd_edge. */
+static void analog_deep_set(analog_dev_t *ad, int on,
+                            const oid_config_t *cfg) {
     /* Where the virtual keys stand comes from socd, which reflects the
      * edges already APPLIED. Where they should end up comes from the
      * front-end's `live`, which is this sample's truth - socd still lags it
      * by whatever edges have not been routed yet. Targeting socd instead
      * would press a key for a finger that left on this very sample, then
      * release it again when the edge lands: a phantom note on the way out
-     * of a wobble. */
+     * of a rock. */
     int cur[2]  = { ad->socd.k1, ad->socd.k2 };
     int next[2] = { ad->keys.key[0].live, ad->keys.key[1].live };
     int from[2], to[2];
 
     socd_virtual_state(cur, ad->socd.act,
-                       ad->regime ? cfg->socd : SOCD_OFF, from);
+                       ad->deep ? cfg->socd : SOCD_OFF, from);
 
     if (on) {
         int keep = ad->last_press;
         if (!next[keep]) keep = !keep;      /* it lifted; the other has it */
         ad->socd.act = (keep == 0);
     }
-    ad->regime = on;
+    ad->deep      = on;
+    ad->act_bound = 0;   /* rebound by the first key to dip; see below */
     socd_virtual_state(next, ad->socd.act, on ? cfg->socd : SOCD_OFF, to);
 
-    /* Reconciliation only ever RELEASES. Engaging never wants a press
-     * anyway - it goes from two virtual keys down to one - and on the way
-     * out a press would be a spurious note.
+    /* Emit the difference in whichever direction it runs.
      *
-     * That matters because `deep` does not clear until release_mm, so a
-     * finger leaving the switch is still inside the regime while it rises:
-     * its rapid-trigger release fires at deep_release_mm off the floor and
-     * the reverting toggle answers it by pressing the OTHER key, which is
-     * the one being lifted. Pressing the still-held key here to put OFF's
-     * picture right would then fire a second note for the same departure.
-     * One beat per lift, not two.
+     * ARMING is release-only by construction: it goes from OFF's two keys
+     * down to the toggle's one. Nothing is pressed and nothing clicks, which
+     * is the whole "silent at the latch" contract - planting your fingers is
+     * not a note, and the notes for both keys already landed under OFF when
+     * they bottomed.
      *
-     * The cost is that the still-held key's virtual is left up until that
-     * key next moves, at which point the plain remap presses it again. In
-     * practice a finger that stays down after a wobble is about to tap or
-     * lift anyway, and either resyncs it. */
+     * DISARMING may PRESS: OFF wants the still-held key's virtual back down,
+     * and without that press the hold is stranded - analog_key_feed still
+     * believes that key live, so it would only ever run the RELEASE check for
+     * it and nothing could put its virtual back. The cost is a second note
+     * for one lift, which is the cheaper of the two mistakes. */
     for (int k = 0; k < 2; k++) {
         if (from[k] == to[k]) continue;
         libevdev_uinput_write_event(uidev, EV_KEY,
@@ -2272,73 +2289,111 @@ static void analog_regime_set(analog_dev_t *ad, int on,
     }
 }
 
-/* Decide whether the wobble is over, before this sample's edges are applied.
+/* Resolve the `deep` latch for this sample, before the sample's edges are
+ * applied.
  *
- * The lapse tests `deep` alone. Rapid trigger lifts and re-presses the
- * emitted keys constantly, so a moment where one is up is mid-rock, not the
- * end of the gesture; only a finger actually leaving the switch ends it.
+ * This is the whole discriminator between the two play patterns, and both
+ * halves are pure depth tests on the CURRENT frame - no per-key latch, no
+ * comparison of one key's depth against the other's. That last point is not
+ * an accident: every abandoned version of this feature gated on relative
+ * depth, trying to decide whether a shallow press "deserved" to steal from a
+ * deep one, and that is not a problem that exists. Do not reintroduce it.
  *
- * Doing it before the edges is what stops the lift that ends a wobble from
+ * Deciding before the edges is what stops the lift that ends a rock from
  * being reverted by a toggle on its way out: the release then lands as a
  * plain release, over virtual keys the reconciliation has already put where
  * SOCD_OFF expects them. */
-static void analog_regime_update(analog_dev_t *ad, const oid_config_t *cfg,
-                                 const float *depth) {
-    /* Ends when either key comes all the way off. `deep` is a latch, so
-     * this rides through the constant lifting and re-pressing of a rock -
-     * a moment where one virtual key is up is mid-gesture, not the end of
-     * it. Checked before this sample's edges so the release that ends a
-     * wobble lands as a plain release rather than being reverted by a
-     * toggle on its way out. */
-    if (ad->regime && !(ad->keys.key[0].deep && ad->keys.key[1].deep)) {
-        analog_regime_set(ad, 0, cfg);
+static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
+                               const float *depth) {
+    const analog_config_t *a = &cfg->analog;
+
+    if (ad->deep) {
+        /* Either finger back past actuation ends it: the player has left
+         * the rock and is tapping again. Note this is actuation_mm, not
+         * release_mm - the rock is over as soon as a finger is off the key
+         * in any meaningful sense, not only once it has left the switch. */
+        if (depth[0] < a->actuation_mm || depth[1] < a->actuation_mm)
+            analog_deep_set(ad, 0, cfg);
         return;
     }
 
-    /* Starts when both keys are against the backplate at once.
+    /* Both against the backplate in ONE sample.
      *
-     * Every wobble begins that way - you plant both fingers - so it never
-     * misses one, and unlike a depth in the middle of travel the backplate
-     * is a hard physical stop: you can hit it without proprioception, and
-     * "don't bottom both keys at once" is an instruction a player can
-     * actually follow.
+     * Alt-tapping cannot satisfy this. Its defining shape is one finger
+     * leaving as the other arrives, so the two are never both on the floor
+     * together, however fast it is played and however much the presses
+     * overlap in the middle of travel. Rocking, by contrast, BEGINS by
+     * planting both - you cannot start one any other way. That asymmetry is
+     * the entire signal, and unlike a depth in the middle of travel the
+     * backplate is a hard physical stop: you can hit it without
+     * proprioception, and "plant both keys to start rocking" is an
+     * instruction a player can actually follow.
      *
-     * It does NOT distinguish a slider held on one key from a wobble
-     * starting on both. Nothing evaluated in one instant can - at the
-     * moment the second key lands the two are the same observation, and
-     * the information separating them does not exist yet. This trades that
-     * for a trigger you can aim.
-     *
-     * Decided before the sample's edges so the arriving key's press runs
-     * under the toggle and takes over at once. There is no churn to avoid:
-     * only one virtual key is down at this point, because the press that
-     * completes the pair has not been applied yet. */
-    if (!ad->regime) {
-        /* `deep` as well as bottomed, so engaging and lapsing agree about
-         * what commitment means. In any sane config it is implied - the
-         * backplate is far below actuation_mm, so a bottomed key is live
-         * and rule 4 has already latched it by the time this runs - but
-         * without it a config whose actuation sits below the backplate
-         * could engage with neither key registering as pressed, and then
-         * lapse again on the next sample because the lapse DOES test
-         * `deep`. The config check below rejects that config too; this
-         * keeps the two halves of the rule honest regardless. */
-        float floor_mm = cfg->analog.travel_mm - cfg->analog.bottom_out_mm;
-        if (depth[0] >= floor_mm && depth[1] >= floor_mm &&
-            ad->keys.key[0].deep && ad->keys.key[1].deep)
-            analog_regime_set(ad, 1, cfg);
-    }
+     * Hysteresis is enormous by construction - on the defaults this arms at
+     * 3.80mm and disarms at 1.00mm - so there is no chatter and no need for
+     * a debounce counter. "One consecutive sample" IS the instantaneous
+     * test; if a longer confirmation is ever wanted it wraps this test and
+     * nothing else moves. */
+    float floor_mm = a->travel_mm - a->bottom_out_mm;
+    if (depth[0] >= floor_mm && depth[1] >= floor_mm)
+        analog_deep_set(ad, 1, cfg);
 }
 
-/* Route one synthesized edge into the SOCD core under whatever regime is in
- * force. The regime itself is resolved once per sample in analog_drain,
- * before any of that sample's edges are applied. */
+/* Route one synthesized edge into the SOCD core under whatever mode the
+ * `deep` latch selects. The latch itself is resolved once per sample in
+ * analog_drain, before any of that sample's edges are applied. */
 static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
                             const oid_config_t *cfg) {
+    /* cfg->socd is SOCD_ANALOG here; socd_apply special-cases only OFF and
+     * SNAPPY, so ANALOG runs the toggle path. Deliberate, not accidental. */
+    int mode = ad->deep ? cfg->socd : SOCD_OFF;
+
+    /* Snapshot BEFORE the act binding below. `before` has to describe the
+     * virtual keys as actually written, and `act` is what names them - bind
+     * first and this snapshot describes the picture for the NEW act, which
+     * is the inverse of reality in exactly the case the gate below exists
+     * for. Do not "simplify" this by moving it down. */
+    int held[2] = { ad->socd.k1, ad->socd.k2 };
+    int before[2];
+    socd_virtual_state(held, ad->socd.act, mode, before);
+
+    /* The first key to dip out of the latch owns the output, so that its
+     * release is the one the toggle reverts. Deferring this is the point:
+     * at the moment the latch arms both keys are on the floor and nothing
+     * yet says which finger is leaving, so any choice made there is a
+     * guess - and guessing wrong presses the virtual key of the finger that
+     * is on its way up. The first edge after arming is necessarily a
+     * release (both keys are live, and a live key can only release), which
+     * is exactly the event that answers the question. */
+    if (ad->deep && !ad->act_bound && value == 0) {
+        ad->socd.act  = is_k1;
+        ad->act_bound = 1;
+    }
     if (value == 1)
         ad->last_press = is_k1 ? 0 : 1;
-    return socd_apply(&ad->socd, is_k1, value,
-                      ad->regime ? cfg->socd : SOCD_OFF, cfg);
+
+    int voice = socd_apply(&ad->socd, is_k1, value, mode, cfg);
+
+    int after[2];
+    held[0] = ad->socd.k1;
+    held[1] = ad->socd.k2;
+    socd_virtual_state(held, ad->socd.act, mode, after);
+
+    /* Suppress the click when the "press" was a no-change event the input
+     * core drops - a beat you hear but the game never sees.
+     *
+     * This is the common case, not a corner. Ride k1, plant k2 (so the latch
+     * keeps v2 and releases v1), then lift k1: S_RELEASE writes up(v1) over
+     * an already-up key and down(v2) over an already-down key, both dropped
+     * by the kernel, yet socd_apply still reports VOICE_V2. The silence is
+     * correct - the note for that key landed under SOCD_OFF when it bottomed,
+     * and a second one is a doubled beat for one lift. Every real transition
+     * still changes the picture and still clicks. */
+    if (voice != VOICE_NONE &&
+        !(before[voice - 1] == 0 && after[voice - 1] == 1))
+        voice = VOICE_NONE;
+
+    return voice;
 }
 
 /* Read every queued analog report and turn travel depth into SOCD edges.
@@ -2371,19 +2426,19 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
 
         /* Feed both keys before judging either: engagement and lapse read
          * the deep/live state of BOTH, which is only complete once both
-         * have been fed. The regime is then resolved BEFORE this sample's
+         * have been fed. The latch is then resolved BEFORE this sample's
          * edges are applied, so every edge runs under the mode actually in
          * force for it. That ordering is what stops the lift ending a
-         * wobble from being reverted by a toggle on its way out - the
+         * rock from being reverted by a toggle on its way out - the
          * release lands as a plain release, and the reconciliation in
-         * analog_regime_set has already put the virtual keys where OFF
+         * analog_deep_set has already put the virtual keys where OFF
          * expects them. */
         int edges[2][2], ne[2];
         for (int k = 0; k < 2; k++)
             ne[k] = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
-                                    ad->regime, edges[k]);
+                                    ad->deep, edges[k]);
 
-        analog_regime_update(ad, cfg, depth);
+        analog_deep_update(ad, cfg, depth);
 
         for (int k = 0; k < 2; k++)
             for (int e = 0; e < ne[k]; e++) {
@@ -2597,9 +2652,13 @@ static void print_usage(FILE *s, const char *prog) {
         "doubletapd - SOCD-cleaning input daemon\n"
         "\n"
         "Grabs evdev keyboard devices, applies a SOCD radio-button filter (reverting\n"
-        "toggle, snappy last-input-wins, or off, per the config's 'socd' field) to two\n"
-        "configurable keys, and re-emits everything via a\n"
+        "toggle, snappy last-input-wins, analog, or off, per the config's 'socd'\n"
+        "field) to two configurable keys, and re-emits everything via a\n"
         "single uinput virtual keyboard. Plays a click on each virtual keypress.\n"
+        "\n"
+        "'analog' needs an analog keyboard: it runs 'off' while you alt-tap and\n"
+        "switches to the toggle while you rock, deciding between them on how far\n"
+        "the keys are actually pressed, and adds a software rapid trigger.\n"
         "\n"
         "usage: %s [-h] [-A|-T] [-c CONFIG] [-i DIR]\n"
         "\n"

@@ -73,40 +73,44 @@ audio:
 # Analog mode (socd: analog). OPTIONAL - ignored by every other mode.
 #
 # Analog keyboards report how far each key is pressed, not just whether it
-# is down. That extra information solves a specific problem: while single-
-# tapping one key at speed, a finger resting on the other key can dip just
-# past actuation, and a fixed-threshold toggle cannot tell that from a
-# deliberate press. Each misfire costs two spurious notes.
+# is down. That lets one session serve BOTH play patterns instead of making
+# you pick one here:
 #
-# The wobble starts when BOTH keys are against the backplate at once.
-# Until then the two keys stay fully independent
-# and an incidental overlap costs nothing, which is what you want for
-# ordinary alternate tapping.
+#   alt-tapping  - alternating discrete taps between k1 and k2. Wants `off`:
+#                  at speed the taps overlap, and a toggle reads that
+#                  overlap as a rock and re-presses a key you never struck.
+#   rocking      - both fingers planted, rocking between the keys. Wants
+#                  `toggle`, for gap-free alternation.
 #
-# Once engaged the toggle holds until a key comes all the way back up, i.e.
-# until the keys come back to the top. Rapid trigger lifting both virtual
-# keys mid-rock is part of the gesture, not the end of it, so it rides
-# straight through.
+# The switch between them is the `deep` latch:
 #
-# The wobble is a GESTURE, not a threshold: it starts when both keys are
-# against the backplate at once, and lasts until one of them comes all the
-# way back up past release_mm. Nothing else arms it. Where the backplate
-# starts is rapid_trigger.bottom_out_mm, which is therefore the single most
-# important number here.
+#   ARMS   when BOTH keys are on the backplate in one report -> toggle
+#   DISARMS when EITHER key comes back up past actuation_mm  -> off
 #
-# It cannot tell a slider held on one key from a wobble starting on both -
-# at the instant the second key lands those are the same observation. What
-# it gives you instead is a trigger you can aim: the backplate is a hard
-# stop, so "don't bottom both keys at once" is something you can actually
-# do, unlike "don't cross some depth in the middle of travel".
+# Planting both keys is the rock and nothing else is: alt-tapping's defining
+# shape is one finger leaving as the other arrives, so the two are never on
+# the floor together however fast you play. Until it arms, the two keys stay
+# fully independent and an incidental overlap costs nothing.
 #
-# Rapid trigger then runs two profiles, picked by whether the wobble is
-# engaged - not by any depth. Riding uses deep_press_mm/deep_release_mm,
-# tapping uses press_mm/release_mm.
+# Because the backplate is a hard physical stop, this is a trigger you can
+# aim - "plant both keys to start rocking" is something you can actually do,
+# unlike "cross some depth in the middle of travel". Where the backplate
+# starts is rapid_trigger.bottom_out_mm, the single most important number
+# here: it defines the latch AND the rapid-trigger bottom-out line.
+#
+# Arming is silent - it emits no press and no click, since the notes for
+# both keys already landed when they bottomed. One key held deep while the
+# other is tapped is NOT treated as anything special; the two keys' depths
+# are never compared against each other.
+#
+# Rapid trigger runs two profiles, picked by whether the latch is armed -
+# not by any depth. Riding uses deep_press_mm/deep_release_mm, tapping uses
+# press_mm/release_mm.
 #
 # Run `doubletapd -A` to watch live travel depth and pick numbers against
 # your own hands, or `doubletapd -T > s.csv` to record a session and replay
-# it offline (see the replay tool).
+# it offline (see the replay tool). Recording your own alt-tapping and
+# checking that `replay` reports ZERO latches is the test that matters.
 #
 # Turn OFF the keyboard's own rapid trigger and SOCD (Snappy Tappy / Rappy
 # Snappy) in its configuration tool - the daemon does both itself here, and
@@ -115,26 +119,27 @@ audio:
 # analog:
 #   device: auto          # or an explicit /dev/hidrawN
 #   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
-#   actuation_mm: 1.0     # press threshold
+#   actuation_mm: 1.0     # press threshold, and what DISARMS the latch
 #   rapid_trigger:
 #     enabled: true
 #     press_mm: 0.3       # downward reversal that re-presses  } tapping
 #     release_mm: 0.3     # upward reversal that releases      } zone
-#     deep_press_mm: off  # while the wobble is engaged. "off" means the backplate
-#                         # is the ONLY thing that re-presses - the setting
+#     deep_press_mm: off  # while riding. "off" means the backplate is the
+#                         # ONLY thing that re-presses - the setting
 #                         # Wootility will not let you express, and the one
-#                         # a rocking/wobble style wants. Unset mirrors
-#                         # press_mm.
-#     deep_release_mm: 0.3  # while the wobble is engaged. "off" holds the key until
-#                         # a full release, which is how Keychron's bottom
-#                         # dead zone behaves - be aware it also means a
-#                         # wobble emits nothing, since the beats come from
-#                         # the release/re-press pair. Unset mirrors
-#                         # release_mm.
-#     bottom_out_mm: 0.05 # where the backplate starts. Bottoming out always
-#                         # presses however small the down-travel, AND
-#                         # bottoming BOTH keys at once is what starts a
-#                         # wobble. Must be greater than 0.
+#                         # a rocking style wants. Unset mirrors press_mm.
+#     deep_release_mm: 0.3  # while riding. "off" holds the key until a full
+#                         # release, which is how Keychron's bottom dead
+#                         # zone behaves - be aware it also means a rock
+#                         # emits nothing, since the beats come from the
+#                         # release/re-press pair. Unset mirrors release_mm.
+#     bottom_out_mm: 0.2  # where the backplate starts, measured from full
+#                         # travel: 0.2 on a 4.0mm switch = 95%. Bottoming
+#                         # out always presses however small the
+#                         # down-travel, AND both keys reaching it at once
+#                         # is what arms the deep latch. Must be > 0; keep
+#                         # it under ~10% of travel, or a firm tap can
+#                         # reach it and alt-tapping may arm the latch.
 #   hid_k1: auto          # HID usage ids; derived from the keyboard's own
 #   hid_k2: auto          # keymap unless pinned here (see -A)
 

@@ -11,11 +11,15 @@
  * every decision here is made by the same code the daemon runs - not a
  * reimplementation that could drift from it.
  *
- * The question it exists to answer: does ordinary alternate tapping ever
- * engage the SOCD regime? That needs both keys past socd_depth_mm and both
- * still emitting-pressed at the same instant, which is a matter of finger
- * timing and travel depth rather than of hitting any notes - so a trace
- * recorded against a metronome answers it as well as one from a map.
+ * The question it exists to answer: does ordinary alt-tapping ever arm the
+ * `deep` latch? Arming needs BOTH keys on the backplate in one report, and
+ * alt-tapping's defining shape is one finger leaving as the other arrives -
+ * so in principle it never can. In practice that depends on how hard the
+ * trace's author bottoms out and how wide `bottom_out_mm` is, which is a
+ * matter of finger timing and travel depth rather than of hitting any
+ * notes: a trace recorded against a metronome answers it as well as one
+ * from a map. An alt-tap trace that reports ZERO latches is the acceptance
+ * test for the whole feature.
  *
  *   build:  cmake --build build --target replay
  *   usage:  ./build/replay [-c CONFIG] TRACE.csv
@@ -112,23 +116,23 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
 
     for (size_t i = 0; i < tr->n; i++) {
         int   edges[2][2], ne[2];
-        int   was = ad.regime;
+        int   was = ad.deep;
         g_now_us = tr->f[i].us;
 
         for (int k = 0; k < 2; k++)
             ne[k] = analog_key_feed(&ad.keys, k, tr->f[i].mm[k],
-                                    &cfg->analog, ad.regime, edges[k]);
-        analog_regime_update(&ad, cfg, tr->f[i].mm);
+                                    &cfg->analog, ad.deep, edges[k]);
+        analog_deep_update(&ad, cfg, tr->f[i].mm);
         for (int k = 0; k < 2; k++)
             for (int e = 0; e < ne[k]; e++)
                 analog_socd_edge(&ad, k == 0, edges[k][e], cfg);
 
-        if (!was && ad.regime) {
+        if (!was && ad.deep) {
             g_run.engagements++;
             if (g_run.first_engage_us < 0)
                 g_run.first_engage_us = tr->f[i].us;
             if (g_verbose)
-                printf("  engaged at %8.3fs   k1=%.2fmm  k2=%.2fmm\n",
+                printf("  latched at %8.3fs   k1=%.2fmm  k2=%.2fmm\n",
                        tr->f[i].us / 1e6, (double)tr->f[i].mm[0],
                        (double)tr->f[i].mm[1]);
         }
@@ -211,8 +215,8 @@ int main(int argc, char **argv) {
             default:
             fprintf(stderr,
                     "usage: %s [-c CONFIG] [-v] [-q] TRACE.csv\n"
-                    "  -v  list every engagement\n"
-                    "  -q  skip the socd_depth_mm sweep\n", argv[0]);
+                    "  -v  list every latch\n"
+                    "  -q  skip the bottom_out_mm sweep\n", argv[0]);
             return EXIT_FAILURE;
         }
     }
@@ -244,24 +248,28 @@ int main(int argc, char **argv) {
     run_t r;
     printf("\nwith the config as it stands:\n");
     replay_run(&tr, &cfg, &r);
-    printf("  %u engagement%s, %u virtual presses emitted\n",
-           r.engagements, r.engagements == 1 ? "" : "s", r.presses);
+    printf("  %u deep latch%s, %u virtual presses emitted\n",
+           r.engagements, r.engagements == 1 ? "" : "es", r.presses);
     if (r.engagements)
         printf("  first at %.3fs\n", r.first_engage_us / 1e6);
 
     report_style(&tr, &cfg);
 
     if (sweep) {
-        printf("\nengagements vs bottom_out_mm (where the backplate starts)\n");
+        printf("\ndeep latches vs bottom_out_mm (where the backplate "
+               "starts)\n");
         float keep = cfg.analog.bottom_out_mm;
         static const float bo[] = { 0.02f, 0.05f, 0.08f, 0.10f, 0.15f,
                                     0.20f, 0.30f, 0.50f, 0.80f };
         for (size_t i = 0; i < sizeof(bo) / sizeof(bo[0]); i++) {
             cfg.analog.bottom_out_mm = bo[i];
             replay_run(&tr, &cfg, &r);
-            printf("  %4.2fmm  (backplate at %5.2fmm)  %5u engagements\n",
+            printf("  %4.2fmm  (backplate at %5.2fmm, %4.1f%%)  %5u latches\n",
                    (double)bo[i],
-                   (double)(cfg.analog.travel_mm - bo[i]), r.engagements);
+                   (double)(cfg.analog.travel_mm - bo[i]),
+                   (double)((cfg.analog.travel_mm - bo[i])
+                            / cfg.analog.travel_mm * 100.0f),
+                   r.engagements);
         }
         cfg.analog.bottom_out_mm = keep;
     }
