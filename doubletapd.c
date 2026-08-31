@@ -2415,6 +2415,52 @@ static void release_stuck(socd_state_t *in, const oid_config_t *cfg) {
     libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
 }
 
+/* Bring the analog interface back after it has gone away.
+ *
+ * Losing it is survivable - the daemon drops to the evdev path rather than
+ * dying - but it used to be PERMANENT: the evdev node returns through the
+ * inotify reconcile while nothing ever retried the hidraw one, so a replug,
+ * a USB glitch or a suspend left the daemon quietly running the digital
+ * toggle under an analog config until someone restarted it. Silent, and
+ * indistinguishable from the state machine misbehaving.
+ *
+ * Nothing watches /sys/class/hidraw, so the evdev node coming back is the
+ * signal that the board is back; the analog node is retried alongside it.
+ * A failed retry is quiet (analog_open only complains about permissions,
+ * not absence), so this can run on every reconcile pass.
+ *
+ * The re-marking at the end is the part that is easy to miss. Devices that
+ * survived the outage had in->analog cleared when the board went away, and
+ * reconcile_devices only sets it on devices it OPENS - so without this the
+ * analog keyboard's digital k1/k2 would flow through on top of the analog
+ * path and every press would be emitted twice. */
+static void analog_reconcile(analog_dev_t **ad, analog_dev_t **adp,
+                             const oid_config_t *cfg, dev_list_t *devs,
+                             const char *input_dir, int epfd) {
+    if (cfg->socd != SOCD_ANALOG || *ad || devs->n == 0)
+        return;
+
+    analog_dev_t *n = analog_dev_open(cfg, input_dir);
+    if (!n)
+        return;
+
+    struct epoll_event ev = { .events = EPOLLIN, .data = { .ptr = n } };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, n->fd, &ev) < 0) {
+        LOG_WARN("epoll_ctl ADD analog: %s - staying on the digital path",
+                 strerror(errno));
+        analog_dev_close(n);
+        return;
+    }
+    *ad = *adp = n;
+
+    for (size_t d = 0; d < devs->n; d++)
+        devs->v[d]->analog =
+            libevdev_get_id_vendor(devs->v[d]->dev)  == (int)g_analog_vid &&
+            libevdev_get_id_product(devs->v[d]->dev) == (int)g_analog_pid;
+
+    LOG_INFO("Analog interface recovered - back on the analog path");
+}
+
 static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                     const char *input_dir, analog_dev_t **adp) {
     analog_dev_t *ad = *adp;   /* cleared through adp if it disappears */
@@ -2525,8 +2571,10 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                 free(in);
             }
         }
-        if (rescan)
+        if (rescan) {
             reconcile_devices(devs, cfg, input_dir, epfd, 0);
+            analog_reconcile(&ad, adp, cfg, devs, input_dir, epfd);
+        }
         if (devs->n == 0 && ifd < 0) {
             LOG_ERR("No devices left and hotplug unavailable - exiting");
             break;
