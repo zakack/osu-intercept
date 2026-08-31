@@ -120,13 +120,19 @@ int main(void) {
     sample(3.50f, 3.45f);
     expect_log("reaches the backplate - beat lands there", "v1- v2+");
 
-    puts("C. lifting a finger out ends it, no second note");
+    puts("C. lifting a finger out ends it, hold preserved");
     sample(3.50f, 0.02f);
-    /* Two writes: the reconciliation releases it, then k2's own release
-     * routes through SOCD_OFF over an already-up key. The input core drops
-     * a no-change key event, so userspace sees one. What matters is that
-     * no PRESS is emitted. */
-    expect_log("k2 leaves the switch", "v2- v2-");
+    /* k1 is still on the backplate, so SOCD_OFF wants its virtual key
+     * DOWN and the reconciliation presses it. That press is a second note
+     * for one lift, and it is the price of not stranding the hold: an
+     * earlier revision released only, which left the still-held key with
+     * no virtual key down and no way to recover, because analog_key_feed
+     * still believed it live and so would only ever run the RELEASE check
+     * for it. The duplicate v2- is the reconciliation releasing it and
+     * then k2's own release routing through SOCD_OFF over an already-up
+     * key; the input core drops the no-change event. */
+    expect_log("k2 leaves; k1's hold is restored", "v1+ v2- v2-");
+    expect_int("  k1 still held", ad.socd.k1, 1);
     expect_int("  regime off", ad.regime, 0);
     expect_int("  k2 no longer committed", ad.keys.key[1].deep, 0);
     expect_int("  k1 still held", ad.socd.k1, 1);

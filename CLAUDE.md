@@ -235,19 +235,21 @@ down in reverse order.
   this sample's truth. Using `socd` for the target presses a key for a
   finger that left on this very sample and releases it again when the edge
   lands — a phantom note on the way out of a wobble.
-- Reconciliation only ever RELEASES, never presses. `deep` does not clear
-  until `release_mm`, so a finger leaving is still inside the regime while
-  it rises: its rapid-trigger release fires at `deep_release_mm` off the
-  floor and the reverting toggle answers by pressing the OTHER key — the
-  one being lifted. Pressing the still-held key here to complete OFF's
-  picture would fire a SECOND note for the same departure. One beat per
-  lift. The still-held key's virtual is left up until that key next moves,
-  where the plain remap presses it again. No threshold fixes this: the rt
-  release fires within `deep_release_mm` of the floor, while the regime
-  lasts until the key clears `release_mm`, so a departing finger is always
-  still inside it when that edge lands. The only alternative is snappy
-  release semantics, which halves the wobble's note rate — a feel change,
-  not a fix.
+- Reconciliation emits BOTH releases and presses. It must: on lapse,
+  SOCD_OFF wants a virtual key down for every held physical key, and a
+  release-only reconciliation strands the survivor — it leaves the still-held
+  key with no virtual key down and NO WAY TO RECOVER, because
+  `analog_key_feed` still has it `live` and so only ever runs the release
+  check for it. The desync then persists until that key is fully released
+  and pressed again. A trace of a real wobble triple caught this: the
+  gesture ended with a key on the backplate and nothing held.
+  The cost is a second note when lifting out of a wobble — the toggle's
+  revert fires on the departing key's rapid-trigger release, and the lapse
+  then has to correct it. Both are unavoidable without knowing the future:
+  at the moment of the revert, a rock and a departure look identical. The
+  only way to have neither is snappy release semantics, where a release
+  reverts only when the ACTIVE key lifts; that costs half the wobble's note
+  rate, which is a feel change rather than a fix.
 - Engagement must never be evaluated at a press edge, however tempting. The
   edge fires at `actuation_mm` or at a rapid-trigger reversal, before the
   key has travelled, so any test of the incoming key's depth there hinges

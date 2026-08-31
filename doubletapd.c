@@ -2262,11 +2262,13 @@ static void analog_regime_set(analog_dev_t *ad, int on,
      * practice a finger that stays down after a wobble is about to tap or
      * lift anyway, and either resyncs it. */
     for (int k = 0; k < 2; k++) {
-        if (from[k] && !to[k]) {
-            libevdev_uinput_write_event(uidev, EV_KEY,
-                                        k == 0 ? cfg->v1 : cfg->v2, 0);
-            libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-        }
+        if (from[k] == to[k]) continue;
+        libevdev_uinput_write_event(uidev, EV_KEY,
+                                    k == 0 ? cfg->v1 : cfg->v2, to[k]);
+        libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+        if (to[k])
+            audio_trigger(k);   /* a press is a press; keep the click and
+                                 * the emitted output in step */
     }
 }
 
