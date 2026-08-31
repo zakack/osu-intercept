@@ -11,14 +11,15 @@ them) — either an explicit config list or, by default, every
 keyboard-shaped device advertising both configured keys, with
 inotify-driven hotplug in both cases — applies a SOCD state machine to two
 configured physical keys — "toggle" (last-input + reverting toggle; "on"
-is a synonym), "snappy" (last input wins, no latching), or "off" (no
+is a synonym), "snappy" (last input wins, no latching), "analog" (toggle,
+but driven by travel depth read from an analog keyboard), or "off" (no
 cleaning, just the k1/k2 -> v1/v2 remap), selected by the top-level
 `socd` config field — and re-emits all input through a
 single uinput virtual keyboard. It also plays a click sound via PipeWire on
 every virtual keypress. Built for rhythm games (osu!) where fast key
 alternation needs a "rocking" input pattern instead of naive SOCD handling.
 
-The entire implementation lives in `doubletapd.c` (~980 lines) — there is
+The entire implementation lives in `doubletapd.c` (~2450 lines) — there is
 no multi-module structure.
 
 ## Build
@@ -54,16 +55,22 @@ falls back to the installed default (`/usr/share/doubletap/config.yaml`;
 CMake bakes the real prefix in via `DEF_CONFIG`/`DEF_WAV` compile
 definitions). See `config.yaml` for the schema: `devices` (optional list of
 `/dev/input/by-id/*` paths; omitted or `auto` means auto-discovery), `socd`
-(`toggle` default, `on` as a synonym, `snappy`, or `off`), `keys`
+(`toggle` default, `on` as a synonym, `snappy`, `analog`, or `off`), `keys`
 (k1/k2 physical -> v1/v2 virtual, symbolic `KEY_*` names or numeric codes),
 `audio` (enabled + wav path), `uinput`
-(virtual device name). After editing config, restart via
+(virtual device name), `analog` (analog-mode thresholds; see below). After
+editing config, restart via
 `systemctl --user restart doubletap`. The `-i DIR` flag overrides the
 scanned/watched device directory (default `/dev/input`) — mainly for
 integration testing against a directory of symlinks to synthetic uinput
-nodes.
-
-`packaging/arch/` holds an AUR-style `-git` PKGBUILD.
+nodes. The `-A` flag runs the analog monitor (live travel depth, no grab,
+no uinput device) for picking thresholds and discovering HID usage ids.
+`-T` is the same passivity with machine-readable output: CSV of k1/k2
+travel per report, for replaying a session offline. `tools/replay.c`
+consumes it — built on demand with `cmake --build build --target replay`,
+excluded from `all`, and NOT installed. It `#include`s `doubletapd.c` and
+stubs only the uinput writes, so it exercises the daemon's real state
+machine rather than a copy that could drift; keep it that way.
 
 ## Architecture
 
@@ -121,7 +128,27 @@ sections (search for the `/* --- */` banner comments):
    (autorepeat included), presses still return 1 for the audio trigger,
    and `k1`/`k2` are still tracked so `release_stuck` works.
 
-5. **Event loop** (`run_loop`/`drain_device`) — a single-threaded
+5. **Analog input** (`analog_*`, `hid_map_*`) — optional path used only by
+   `socd: analog`. Analog keyboards report per-key travel on a
+   vendor-defined HID interface (usage page `0xFF53` v2 / `0xFF54` v1); the
+   kernel makes no evdev node for a vendor usage page, so it exists purely
+   as `/dev/hidrawN` — a pollable fd that joins the same epoll set, and one
+   `EVIOCGRAB` has no bearing on. No vendor SDK and no kernel driver is
+   involved. `analog_open` finds the node by matching the Wooting VID in
+   sysfs `uevent` then scanning `report_descriptor` for the vendor usage
+   page. `analog_decode` unpacks 16 slots per report. **A released key
+   vanishes from the report rather than reporting a final zero**, so rest is
+   inferred from absence — `analog_drain` rebuilds the full depth of k1/k2
+   each frame rather than tracking deltas. `analog_key_feed` is the per-key
+   front-end: it turns depth into press/release edges using `actuation_mm`
+   plus a two-profile software rapid trigger — the anchor (`rt_extreme`)
+   whose profile follows the regime — `press_mm`/`release_mm` while
+   tapping, `deep_press_mm`/`deep_release_mm` while riding, either of which
+   may be `off`. k1/k2 -> HID usage
+   mapping is derived from the keyboard's own keymap via `EVIOCGKEYCODE_V2`
+   (hid-input stores the HID usage as the scancode), not a hardcoded table.
+
+6. **Event loop** (`run_loop`/`drain_device`) — a single-threaded
    `epoll`-based loop multiplexes all grabbed devices plus an inotify fd
    watching the input dir (and its `by-id`/`by-path` subdirs) with
    `IN_CREATE | IN_ATTRIB | IN_MOVED_TO`; `IN_ATTRIB` matters because a
@@ -135,7 +162,7 @@ sections (search for the `/* --- */` banner comments):
    keeps running with zero devices, waiting for hotplug (it only aborts at
    startup if nothing opened AND inotify is unavailable).
 
-6. **Audio** (`wav_load`, `audio_init`, `on_process`, `audio_trigger`) — a
+7. **Audio** (`wav_load`, `audio_init`, `on_process`, `audio_trigger`) — a
    hand-rolled WAV reader (16/24/32-bit PCM) loads the click sample into a
    float buffer up front. Playback runs on a dedicated PipeWire thread loop
    (`pw_thread_loop`); `on_process` is the realtime audio callback and only
@@ -148,14 +175,124 @@ sections (search for the `/* --- */` banner comments):
 `SCHED_FIFO` realtime priority (best-effort, warns and falls back on
 failure) -> best-effort audio init (`mlockall` if audio is enabled, to
 avoid page faults in the RT callback) -> build the virtual device (safe
-before any grab: discovery skips it via `is_doubletap_output`) -> install
+before any grab: discovery skips it via `is_doubletap_output`) -> open the
+analog interface if `socd: analog` (before the first reconcile, so grabbed
+keyboards already know their k1/k2 are analog-driven; a failure here just
+warns and falls back to `toggle`) -> install
 SIGINT/SIGTERM handlers -> run the event loop (which opens/grabs devices
 via the initial reconcile pass and handles hotplug thereafter) -> tear
 down in reverse order.
 
+## Key invariants to preserve when editing the state machine
+
+- `socd_apply` is the single SOCD core, shared by both input paths: the
+  evdev path (`process_event`) feeds it real key events, the analog path
+  (via `analog_socd_edge`) feeds it edges synthesized from travel depth.
+  Adding a behavior to one path and not the other is almost always a bug.
+  It takes the mode as an argument rather than reading `cfg->socd`, which is
+  what lets the analog path run a shallow overlap as a plain remap.
+- The wobble is a GESTURE, and the backplate defines it. It starts when
+  BOTH keys are bottomed at the same instant and ends when either stops
+  being committed. `deep` is that commitment latch: set when a `live` key
+  reaches `travel_mm - bottom_out_mm`, cleared only by rule 1 (a full
+  release past `release_mm`). So `bottom_out_mm` is load-bearing — it is
+  not merely a rapid-trigger corner case — and the config check refuses a
+  zero value.
+- It deliberately does NOT distinguish a slider held on one key from a
+  wobble starting on both. At the instant the second key reaches the floor
+  those are the same observation — same depth, velocity and dwell — and the
+  information separating them does not exist yet. Every attempt to find it
+  in one sample has failed and will; what the backplate buys instead is a
+  trigger a player can aim, being a hard physical stop. The harness asserts
+  this trade explicitly so it stays deliberate.
+- The regime is resolved once per sample in `analog_regime_update`, called
+  from `analog_drain` after both keys are fed and BEFORE that sample's
+  edges are applied. Both directions need that ordering: engaging first
+  lets the arriving key's press take over under the toggle immediately
+  (with no churn — only one virtual key is down at that point, the press
+  that completes the pair not yet applied), and lapsing first lets the
+  release that ends a wobble land as a plain release instead of being
+  reverted by a toggle on its way out.
+- The rapid-trigger profile is picked by the REGIME, never by a depth.
+  `analog_key_feed` takes it as an argument. An earlier revision selected
+  on the anchor against a threshold, which re-decided mid-gesture: a rock
+  that overshot the line silently switched to the tapping profile, so its
+  return stroke re-pressed after `press_mm` instead of waiting for the
+  backplate, and the beat landed early on exactly the rocks that went high.
+  Amplitude changing the rule is a limp, not a threshold. The regime lags
+  by one sample here and that is harmless — the sample that engages is a
+  press stroke, where no reversal test runs, and the sample that lapses is
+  a full release, which rule 1 handles before either profile matters.
+- The lapse does NOT test `live`. Rapid trigger lifts and re-presses the
+  emitted keys constantly, so a moment where one is up is mid-rock, not the
+  end of the gesture; only `deep` clearing ends it.
+- Changing regime under held fingers MUST reconcile the virtual keys, which
+  is what `analog_regime_set` does: the two modes disagree about what should
+  be down (OFF wants one virtual key per held physical key, the toggle wants
+  exactly one), and flipping the flag without settling that strands a key.
+  The current picture comes from `socd`, which reflects edges already
+  APPLIED; the target picture comes from the front-end's `live`, which is
+  this sample's truth. Using `socd` for the target presses a key for a
+  finger that left on this very sample and releases it again when the edge
+  lands — a phantom note on the way out of a wobble.
+- Reconciliation emits BOTH releases and presses. It must: on lapse,
+  SOCD_OFF wants a virtual key down for every held physical key, and a
+  release-only reconciliation strands the survivor — it leaves the still-held
+  key with no virtual key down and NO WAY TO RECOVER, because
+  `analog_key_feed` still has it `live` and so only ever runs the release
+  check for it. The desync then persists until that key is fully released
+  and pressed again. A trace of a real wobble triple caught this: the
+  gesture ended with a key on the backplate and nothing held.
+  The cost is a second note when lifting out of a wobble — the toggle's
+  revert fires on the departing key's rapid-trigger release, and the lapse
+  then has to correct it. Both are unavoidable without knowing the future:
+  at the moment of the revert, a rock and a departure look identical. The
+  only way to have neither is snappy release semantics, where a release
+  reverts only when the ACTIVE key lifts; that costs half the wobble's note
+  rate, which is a feel change rather than a fix.
+- Engagement must never be evaluated at a press edge, however tempting. The
+  edge fires at `actuation_mm` or at a rapid-trigger reversal, before the
+  key has travelled, so any test of the incoming key's depth there hinges
+  on where re-presses happen to land. The per-sample check exists precisely
+  so the second key can reach the backplate on its own schedule.
+- Gating the *emission* of a press is not a substitute for gating the
+  regime: two presses that both reach `socd_apply` still trigger the toggle,
+  which is what turns an incidental overlap into an extra keypress.
+- Regime state keys off `deep` and `live`, NOT off `socd.k1`/`socd.k2`.
+  Those track edges already applied and lag the front-end by a sample.
+- In analog mode the digital k1/k2 of the analog keyboard MUST be dropped
+  (`in->analog`, set by matching vendor/product in `input_try_open`), or
+  every press is emitted twice — once from evdev and once from analog.
+- `analog_key_feed` must keep `live` in sync with the edges it actually
+  emits; `socd_apply` assumes strict press/release alternation per key.
+- A zero `rt_deep_press_mm`/`rt_deep_release_mm` means that zone's edge is
+  DISABLED, not that any motion triggers it. The config parser rejects a
+  literal `0` and requires `off`, because the two readings are opposites.
+  With `deep_press_mm` off, `bottom_out_mm` is the only remaining re-press
+  and the config check refuses to let both be disabled.
+- The deep values are resolved from the tapping values in
+  `analog_config_resolve` before any validation, so everything downstream
+  reads concrete numbers and an unconfigured daemon runs one profile.
+- `release_mm` is DERIVED, never configured: `analog_config_resolve` sets
+  it to `actuation_mm * ANALOG_RELEASE_RATIO`. A fixed offset (Keychron's
+  `actn_pt - 3`) cannot work here because actuation ranges from 0.1mm to
+  most of the travel, and a subtraction suiting one end goes negative at
+  the other. A warning fires if the derived value lands under
+  `ANALOG_RELEASE_FLOOR`, where the firmware stops reporting at all.
+- `analog_key_feed` decides edges on `actuation_mm`/`release_mm` and the
+  rapid trigger ALONE. It does not inspect the other key at all; the only
+  cross-key decision in the analog path lives in `analog_socd_edge`. An
+  earlier revision gated presses on the other key's depth to filter a
+  resting finger's dip — that filtered on depth, but a deliberate wobble and
+  an incidental overlap during alternate tapping are identical in depth, so
+  it could not separate them. Anything reaching for that problem again wants
+  direction or dwell, not a depth threshold, and belongs in
+  `analog_socd_edge` where the regime is decided.
+
 ## Key invariants to preserve when editing `process_event`
 
-- `k1`/`k2`/`act` state is per-input-device (`input_dev_t`), not global —
+- `k1`/`k2`/`act` state lives in a `socd_state_t` owned by each input
+  source (embedded in `input_dev_t`, and in `analog_dev_t`), not global —
   multiple physical keyboards are tracked independently even though they
   share one virtual output device.
 - Every emitted `EV_KEY` write must be followed by an `EV_SYN`/`SYN_REPORT`
