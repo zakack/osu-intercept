@@ -69,6 +69,11 @@
 #define DEF_V2     KEY_F14
 #define DEF_NAME   "doubletap virtual keyboard"
 
+/* Upper bound on the physical-key pool. An analog report carries sixteen
+ * slots (ANALOG_SLOTS), so a pool larger than that could not be read by
+ * travel anyway, and nothing sane wants one. */
+#define POOL_MAX   16
+
 /* Installed data paths; CMake overrides these to match the install prefix. */
 #ifndef DEF_WAV
 #define DEF_WAV    "/usr/share/doubletap/click.wav"
@@ -486,15 +491,28 @@ typedef struct {
     float  bottom_out_mm; /* within this of full travel == bottomed out:
                            * presses regardless of rt_press_mm, and, for
                            * both keys at once, arms `deep` */
-    int    hid_k1;        /* HID usage override; -1 == derive from the keymap */
-    int    hid_k2;
+    /* HID usage overrides, parallel to keys.pool; -1 == derive from the
+     * keymap. 'analog.hid_k1'/'hid_k2' are the legacy two-key spelling and
+     * write entries 0 and 1. */
+    int    hid[POOL_MAX];
+    int    n_hid;         /* entries given via the 'hid' list, for checking */
 } analog_config_t;
 
 typedef struct {
     char   **device_paths;
     size_t   n_devices;
     int      auto_discover; /* no 'devices' list: scan for matching keyboards */
-    int      k1, k2, v1, v2;
+    /* The physical key pool. Every entry drives v1/v2 through the slot
+     * layer; which of the two a key gets is decided per press, not here.
+     * The legacy scalar keys.k1/k2 are simply a two-entry pool, so there is
+     * one representation downstream and no special case for the old form. */
+    int      pool[POOL_MAX];
+    int      n_pool;
+    /* Analog only: the two pool INDICES whose travel arms the deep latch.
+     * Defaults to 0 and 1, which is what the legacy k1/k2 form resolves to. */
+    int      latch[2];
+    int      latch_set;     /* 'keys.latch' was given explicitly */
+    int      v1, v2;
     int      socd;
     int      audio_enabled;
     char    *wav_path;      /* base sample; per-key fallback */
@@ -509,8 +527,11 @@ typedef struct {
 
 static void config_init(oid_config_t *c) {
     memset(c, 0, sizeof(*c));
-    c->k1 = DEF_K1;
-    c->k2 = DEF_K2;
+    c->pool[0]  = DEF_K1;
+    c->pool[1]  = DEF_K2;
+    c->n_pool   = 2;
+    c->latch[0] = 0;
+    c->latch[1] = 1;
     c->v1 = DEF_V1;
     c->v2 = DEF_V2;
     c->audio_enabled = 1;
@@ -523,8 +544,8 @@ static void config_init(oid_config_t *c) {
     c->analog.rt_press_mm   = 0.3f;
     c->analog.rt_release_mm = 0.3f;
     c->analog.bottom_out_mm = 0.20f;  /* 95% of the 4mm default travel */
-    c->analog.hid_k1        = -1;   /* sentinel: derive from the keymap */
-    c->analog.hid_k2        = -1;
+    for (int i = 0; i < POOL_MAX; i++)
+        c->analog.hid[i] = -1;      /* sentinel: derive from the keymap */
 }
 
 static void config_free(oid_config_t *c) {
@@ -538,6 +559,34 @@ static void config_free(oid_config_t *c) {
     free(c->uinput_name);
     free(c->analog.device);
     memset(c, 0, sizeof(*c));
+}
+
+/* "auto" (or an unset node) leaves the override alone; anything else must
+ * parse as a HID usage id. */
+static int parse_hid_usage(yaml_node_t *v, int *out) {
+    const char *s = v && v->type == YAML_SCALAR_NODE
+                    ? (const char *)v->data.scalar.value : "";
+    if (!strcasecmp(s, "auto")) return 0;
+    char *end = NULL;
+    errno = 0;
+    long u = strtol(s, &end, 0);
+    if (end == s || *end != '\0' || errno != 0 || u < 0 || u > 0xFFFF)
+        return -1;
+    *out = (int)u;
+    return 0;
+}
+
+/* Name a key code for a message: the symbolic name when libevdev knows one,
+ * otherwise the bare number. Rotates through a few static buffers so more
+ * than one can appear in a single call. */
+static const char *key_name_or(int code) {
+    static char buf[4][32];
+    static int  turn;
+    const char *nm = libevdev_event_code_get_name(EV_KEY, (unsigned)code);
+    if (nm) return nm;
+    turn = (turn + 1) % 4;
+    snprintf(buf[turn], sizeof(buf[turn]), "%d", code);
+    return buf[turn];
 }
 
 /* libyaml document-API helpers --------------------------------------------- */
@@ -662,10 +711,10 @@ static int analog_config_check(const analog_config_t *a) {
                 (double)a->bottom_out_mm, (double)a->travel_mm);
         bad = 1;
     }
-    if (a->hid_k1 >= 0 && a->hid_k1 == a->hid_k2) {
+    if (a->hid[0] >= 0 && a->hid[0] == a->hid[1]) {
         LOG_ERR("'analog.hid_k1' and 'analog.hid_k2' are both 0x%02x: one "
                 "physical key would drive both virtual keys",
-                a->hid_k1);
+                a->hid[0]);
         bad = 1;
     }
     if (bad)
@@ -797,7 +846,6 @@ static int load_config(const char *path, oid_config_t *c) {
             goto out;
         }
         struct { const char *name; int *out; } kmap[] = {
-            { "k1", &c->k1 }, { "k2", &c->k2 },
             { "v1", &c->v1 }, { "v2", &c->v2 },
         };
         for (size_t i = 0; i < sizeof(kmap)/sizeof(kmap[0]); i++) {
@@ -806,6 +854,106 @@ static int load_config(const char *path, oid_config_t *c) {
                 LOG_ERR("invalid key code for 'keys.%s'", kmap[i].name);
                 goto out;
             }
+        }
+
+        /* The pool. 'pool' is the general form; 'k1'/'k2' are the legacy
+         * two-key spelling of the same thing. Accepting both at once would
+         * mean silently picking a winner, so it is an error. */
+        yaml_node_t *pool = map_get(&doc, keys, "pool");
+        yaml_node_t *k1n  = map_get(&doc, keys, "k1");
+        yaml_node_t *k2n  = map_get(&doc, keys, "k2");
+
+        if (pool && (k1n || k2n)) {
+            LOG_ERR("'keys.pool' and 'keys.k1'/'keys.k2' are two spellings "
+                    "of the same setting - use one or the other");
+            goto out;
+        }
+
+        if (pool) {
+            if (pool->type != YAML_SEQUENCE_NODE) {
+                LOG_ERR("'keys.pool' must be a sequence of key codes");
+                goto out;
+            }
+            size_t n = (size_t)(pool->data.sequence.items.top -
+                                pool->data.sequence.items.start);
+            if (n < 2) {
+                LOG_ERR("'keys.pool' needs at least two keys");
+                goto out;
+            }
+            if (n > POOL_MAX) {
+                LOG_ERR("'keys.pool' has %zu keys; the maximum is %d",
+                        n, POOL_MAX);
+                goto out;
+            }
+            c->n_pool = 0;
+            for (yaml_node_item_t *it = pool->data.sequence.items.start;
+                 it < pool->data.sequence.items.top; it++) {
+                int code = 0;
+                if (parse_key_code(ynode(&doc, *it), &code) != 0) {
+                    LOG_ERR("invalid key code in 'keys.pool' (entry %d)",
+                            c->n_pool + 1);
+                    goto out;
+                }
+                for (int j = 0; j < c->n_pool; j++) {
+                    if (c->pool[j] == code) {
+                        LOG_ERR("'keys.pool' lists %s twice",
+                                key_name_or(code));
+                        goto out;
+                    }
+                }
+                c->pool[c->n_pool++] = code;
+            }
+        } else {
+            if (k1n && parse_key_code(k1n, &c->pool[0]) != 0) {
+                LOG_ERR("invalid key code for 'keys.k1'");
+                goto out;
+            }
+            if (k2n && parse_key_code(k2n, &c->pool[1]) != 0) {
+                LOG_ERR("invalid key code for 'keys.k2'");
+                goto out;
+            }
+            c->n_pool = 2;
+            if (c->pool[0] == c->pool[1]) {
+                LOG_ERR("'keys.k1' and 'keys.k2' are the same key");
+                goto out;
+            }
+        }
+
+        /* latch: which two pool keys arm the deep latch. Analog only - it
+         * names a pair of travel-read keys, and nothing else in the daemon
+         * reads travel. Defaults to the first two pool entries, which is
+         * exactly what the legacy k1/k2 form means. */
+        yaml_node_t *latch = map_get(&doc, keys, "latch");
+        if (latch) {
+            if (latch->type != YAML_SEQUENCE_NODE ||
+                latch->data.sequence.items.top -
+                latch->data.sequence.items.start != 2) {
+                LOG_ERR("'keys.latch' must be a sequence of exactly two keys");
+                goto out;
+            }
+            int i = 0;
+            for (yaml_node_item_t *it = latch->data.sequence.items.start;
+                 it < latch->data.sequence.items.top; it++, i++) {
+                int code = 0;
+                if (parse_key_code(ynode(&doc, *it), &code) != 0) {
+                    LOG_ERR("invalid key code in 'keys.latch' (entry %d)",
+                            i + 1);
+                    goto out;
+                }
+                c->latch[i] = -1;
+                for (int j = 0; j < c->n_pool; j++)
+                    if (c->pool[j] == code) { c->latch[i] = j; break; }
+                if (c->latch[i] < 0) {
+                    LOG_ERR("'keys.latch' names %s, which is not in the pool",
+                            key_name_or(code));
+                    goto out;
+                }
+            }
+            if (c->latch[0] == c->latch[1]) {
+                LOG_ERR("'keys.latch' names the same key twice");
+                goto out;
+            }
+            c->latch_set = 1;
         }
     }
 
@@ -910,25 +1058,49 @@ static int load_config(const char *path, oid_config_t *c) {
                          "while riding, the backplate itself is the switch "
                          "and no rapid trigger runs");
         }
-        static const struct { const char *key; size_t off; } hid[] = {
-            { "hid_k1", offsetof(analog_config_t, hid_k1) },
-            { "hid_k2", offsetof(analog_config_t, hid_k2) },
+        /* HID usage overrides. 'hid' is a list parallel to keys.pool;
+         * 'hid_k1'/'hid_k2' are the legacy two-key spelling of entries 0
+         * and 1. Both accept "auto" (or omission) to derive from the
+         * keymap. */
+        static const struct { const char *key; int idx; } hidk[] = {
+            { "hid_k1", 0 }, { "hid_k2", 1 },
         };
-        for (size_t i = 0; i < sizeof(hid) / sizeof(hid[0]); i++) {
-            yaml_node_t *v = map_get(&doc, an, hid[i].key);
-            if (!v) continue;
-            const char *s = v->type == YAML_SCALAR_NODE
-                            ? (const char *)v->data.scalar.value : "";
-            if (!strcasecmp(s, "auto")) continue;
-            char *end = NULL;
-            errno = 0;
-            long u = strtol(s, &end, 0);
-            if (end == s || *end != '\0' || errno != 0 || u < 0 || u > 0xFFFF) {
-                LOG_ERR("'analog.%s' must be \"auto\" or a HID usage id",
-                        hid[i].key);
+        yaml_node_t *hidl = map_get(&doc, an, "hid");
+        if (hidl && (map_get(&doc, an, "hid_k1") ||
+                     map_get(&doc, an, "hid_k2"))) {
+            LOG_ERR("'analog.hid' and 'analog.hid_k1'/'hid_k2' are two "
+                    "spellings of the same setting - use one or the other");
+            goto out;
+        }
+        if (hidl) {
+            if (hidl->type != YAML_SEQUENCE_NODE) {
+                LOG_ERR("'analog.hid' must be a sequence of HID usage ids");
                 goto out;
             }
-            *(int *)((char *)&c->analog + hid[i].off) = (int)u;
+            int i = 0;
+            for (yaml_node_item_t *it = hidl->data.sequence.items.start;
+                 it < hidl->data.sequence.items.top; it++, i++) {
+                if (i >= POOL_MAX) {
+                    LOG_ERR("'analog.hid' has more than %d entries", POOL_MAX);
+                    goto out;
+                }
+                if (parse_hid_usage(ynode(&doc, *it), &c->analog.hid[i]) != 0) {
+                    LOG_ERR("'analog.hid' entry %d must be \"auto\" or a HID "
+                            "usage id", i + 1);
+                    goto out;
+                }
+            }
+            c->analog.n_hid = i;
+        } else {
+            for (size_t i = 0; i < sizeof(hidk) / sizeof(hidk[0]); i++) {
+                yaml_node_t *v = map_get(&doc, an, hidk[i].key);
+                if (!v) continue;
+                if (parse_hid_usage(v, &c->analog.hid[hidk[i].idx]) != 0) {
+                    LOG_ERR("'analog.%s' must be \"auto\" or a HID usage id",
+                            hidk[i].key);
+                    goto out;
+                }
+            }
         }
     }
 
@@ -1000,6 +1172,25 @@ static int load_config(const char *path, oid_config_t *c) {
         if (!c->uinput_name) { LOG_ERR("oom"); goto out; }
     }
 
+    /* A 'hid' list that does not line up with the pool is a mistake worth
+     * naming: a short one silently leaves later keys to the keymap walk, and
+     * a long one silently drops entries. */
+    if (c->analog.n_hid && c->analog.n_hid != c->n_pool) {
+        LOG_ERR("'analog.hid' has %d entries but the pool has %d - it must "
+                "have one per pool key, in pool order",
+                c->analog.n_hid, c->n_pool);
+        goto out;
+    }
+
+    /* 'keys.latch' only means something in analog mode: it names the pair
+     * whose TRAVEL arms the deep latch, and no other mode reads travel.
+     * Silently ignoring it would leave a config that looks like it selects
+     * a behaviour it does not. */
+    if (c->latch_set && c->socd != SOCD_ANALOG) {
+        LOG_ERR("'keys.latch' applies only to 'socd: analog'");
+        goto out;
+    }
+
     analog_config_resolve(&c->analog);
     if (c->socd == SOCD_ANALOG && analog_config_check(&c->analog) != 0)
         goto out;
@@ -1027,12 +1218,82 @@ enum { EP_INPUT = 1, EP_ANALOG = 2 };
  * keyboards are tracked independently even though they share one virtual
  * output device, and the analog path carries its own instance too. */
 typedef struct {
-    int k1;   /* k1 down? */
-    int k2;   /* k2 down? */
+    int k1;   /* slot 0 occupied? */
+    int k2;   /* slot 1 occupied? */
     int act;  /* 1 == v1 active, 0 == v2 (or none) */
     int mode; /* mode of the last edge applied; release_stuck needs the
                * EFFECTIVE mode, which for the analog path is not cfg->socd */
 } socd_state_t;
+
+/* The physical-key -> slot layer, sitting between the input paths and the
+ * SOCD core.
+ *
+ * The core has always had two SLOTS, not two keys: socd_apply's first
+ * argument picks a slot, and the slot picks the virtual code. With one key
+ * per slot that distinction never had to be drawn. A pool of N keys draws
+ * it - which slot a key drives is decided per press here, and everything
+ * downstream (the four-case transition, `act`, release_stuck, the deep
+ * latch) is untouched.
+ *
+ * Slot occupancy is a COUNT, because more than one pool key can share a
+ * slot: a third key pressed while both slots are held has nowhere else to
+ * go. An edge reaches socd_apply only when a count crosses 0<->1, so the
+ * newcomer's press registers as a real transition and its release is silent
+ * while a slot-mate is still down - no phantom note.
+ *
+ * `slot` is seeded by index rather than left unassigned, which is what
+ * keeps a two-key pool identical to the old k1/k2 build: whichever key is
+ * pressed FIRST after startup must still get its own virtual, not whichever
+ * slot happens to alternate next. */
+typedef struct {
+    int slot;  /* which slot this key drives; seeded by index */
+    int held;  /* this key is currently down */
+} pool_key_t;
+
+typedef struct {
+    socd_state_t socd;             /* the 2-slot core, unchanged */
+    pool_key_t   key[POOL_MAX];    /* parallel to cfg->pool */
+    int          count[2];         /* pool keys currently held per slot */
+    int          last_slot;        /* slot of the most recent press */
+} pool_state_t;
+
+static void pool_init(pool_state_t *p, int n) {
+    memset(p, 0, sizeof(*p));
+    for (int i = 0; i < n && i < POOL_MAX; i++)
+        p->key[i].slot = i & 1;
+    /* So the first alternating press lands on slot 0. */
+    p->last_slot = 1;
+}
+
+/* Which pool index is this key code, or -1. */
+static int pool_index(const oid_config_t *cfg, unsigned code) {
+    for (int i = 0; i < cfg->n_pool; i++)
+        if ((unsigned)cfg->pool[i] == code) return i;
+    return -1;
+}
+
+/* Pick the slot for a press of pool index `i`.
+ *
+ * Sticky: a key reuses the slot it last drove whenever that slot is free,
+ * so a key tapped on its own always produces the same virtual and a two-key
+ * pool behaves exactly as k1/k2 always did. When its own slot is taken the
+ * free one wins, which is what makes any sequence of distinct keys
+ * alternate. When BOTH are taken there is no free slot, so the newcomer
+ * alternates off the last press and shares.
+ *
+ * `alternating` drops the sticky rule for the both-free case, so repeated
+ * taps of one key alternate too. It is scoped to `socd: off` with a pool
+ * larger than two - the "F13/F14 riding atop the real keys" shape - and
+ * keyed on the CONFIGURED mode, not the effective one: the analog path runs
+ * effective OFF whenever the latch is not armed, and alternating solo taps
+ * there would contradict what analog mode is for. */
+static int pool_pick_slot(pool_state_t *p, int i, int alternating) {
+    if (p->count[0] == 0 && p->count[1] == 0)
+        return alternating ? !p->last_slot : p->key[i].slot;
+    if (p->count[0] == 0) return 0;
+    if (p->count[1] == 0) return 1;
+    return !p->last_slot;
+}
 
 typedef struct {
     int               kind;    /* EP_INPUT */
@@ -1041,8 +1302,8 @@ typedef struct {
     char             *path;
     dev_t             rdev; /* st_rdev, dedupes nodes reached via symlinks */
     int               grabbed; /* 0 = open but grab deferred (keys held) */
-    int               analog;  /* k1/k2 come from the analog path; drop them */
-    socd_state_t      socd;
+    int               analog;  /* pool keys come from the analog path; drop */
+    pool_state_t      pool;
 } input_dev_t;
 
 /* Grabbed devices as stable heap pointers: epoll user data points at the
@@ -1103,9 +1364,12 @@ static int is_doubletap_output(struct libevdev *dev, const oid_config_t *cfg) {
  * rejected to stay loop-free among remappers. */
 static int auto_grab_ok(struct libevdev *dev, const oid_config_t *cfg) {
     if (libevdev_get_id_bustype(dev) == BUS_VIRTUAL) return 0;
-    if (!libevdev_has_event_code(dev, EV_KEY, (unsigned)cfg->k1) ||
-        !libevdev_has_event_code(dev, EV_KEY, (unsigned)cfg->k2))
-        return 0;
+    /* Every pool key, not just some: the slot layer alternates across the
+     * whole pool, and a board carrying only part of it would alternate
+     * against keys it cannot see. */
+    for (int i = 0; i < cfg->n_pool; i++)
+        if (!libevdev_has_event_code(dev, EV_KEY, (unsigned)cfg->pool[i]))
+            return 0;
     if (libevdev_has_event_type(dev, EV_REL) ||
         libevdev_has_event_type(dev, EV_ABS))
         return 0;
@@ -1189,6 +1453,9 @@ static input_dev_t *input_try_open(const char *path, const oid_config_t *cfg,
         return NULL;
     }
     in->kind    = EP_INPUT;
+    /* Seeds each key's slot by index; zero-init would put every pool key in
+     * slot 0 and the first press of k2 would come out as v1. */
+    pool_init(&in->pool, cfg->n_pool);
     in->analog  = g_analog_vid &&
                   libevdev_get_id_vendor(dev)  == (int)g_analog_vid &&
                   libevdev_get_id_product(dev) == (int)g_analog_pid;
@@ -1445,7 +1712,7 @@ typedef struct {
 } analog_key_t;
 
 typedef struct {
-    analog_key_t key[2];   /* [0] == k1, [1] == k2 */
+    analog_key_t key[POOL_MAX];   /* parallel to cfg->pool */
 } analog_state_t;
 
 /* Feed one sample for one key. idx is 0 (k1) or 1 (k2); a key absent from
@@ -1685,17 +1952,23 @@ typedef struct {
     int            fd;
     int            fmt;
     uint16_t       vid, pid;
-    uint16_t       usage[2];    /* HID usage id of k1, k2 */
+    uint16_t       usage[POOL_MAX];  /* HID usage id per pool index */
+    int            n;                /* == cfg->n_pool */
+    int            latch[2];         /* pool indices of the latch pair */
     char           path[PATH_MAX];
     analog_state_t keys;
-    socd_state_t   socd;
-    int            deep;        /* 1 == both keys planted on the backplate;
-                                 * k1/k2 run the toggle instead of the
-                                 * plain remap. See analog_deep_update. */
-    int            last_press;  /* 0 == k1, 1 == k2: most recent press edge.
-                                 * Picks which key keeps its virtual on when
-                                 * the latch arms with both already
-                                 * down - last input wins. */
+    pool_state_t   pool;        /* slot layer + the SOCD core */
+    int            deep;        /* 1 == both LATCH keys planted on the
+                                 * backplate; they run the toggle instead of
+                                 * the plain remap, and every other pool key
+                                 * is silenced. See analog_deep_update. */
+    int            last_press;  /* POOL INDEX of the most recent press edge.
+                                 * Picks which virtual survives when the
+                                 * latch arms with both already down - last
+                                 * input wins. An index rather than a slot
+                                 * because arming can move a key between
+                                 * slots; analog_deep_set resolves it to a
+                                 * slot after that. */
 } analog_dev_t;
 
 static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
@@ -1713,31 +1986,64 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
         return NULL;
     }
 
-    /* Resolve k1/k2 to HID usage ids: an explicit config override wins,
-     * otherwise walk a keyboard's keymap for the mapping. */
+    ad->n        = cfg->n_pool;
+    ad->latch[0] = cfg->latch[0];
+    ad->latch[1] = cfg->latch[1];
+    pool_init(&ad->pool, ad->n);
+
+    /* Resolve EVERY pool key to a HID usage id: an explicit config override
+     * wins, otherwise walk a keyboard's keymap for the mapping. All of them,
+     * not just the latch pair - in analog mode the whole pool is read by
+     * travel, so that the daemon's own rapid trigger governs every key
+     * rather than half of them running the firmware's actuation instead.
+     * Two different feels inside one burst is the same jitter the deep latch
+     * exists to avoid. */
     static uint16_t usage_of_key[KEY_MAX + 1];
-    if (cfg->analog.hid_k1 < 0 || cfg->analog.hid_k2 < 0)
+    int need_map = 0;
+    for (int i = 0; i < ad->n; i++)
+        if (cfg->analog.hid[i] < 0) need_map = 1;
+    if (need_map)
         hid_map_from_any_keyboard(input_dir, usage_of_key);
 
-    ad->usage[0] = cfg->analog.hid_k1 >= 0 ? (uint16_t)cfg->analog.hid_k1
-                                           : usage_of_key[cfg->k1];
-    ad->usage[1] = cfg->analog.hid_k2 >= 0 ? (uint16_t)cfg->analog.hid_k2
-                                           : usage_of_key[cfg->k2];
-    if (!ad->usage[0] || !ad->usage[1]) {
-        LOG_ERR("could not resolve k1/k2 to HID usage ids - run with -A to "
-                "find them, then set analog.hid_k1 / analog.hid_k2");
-        close(ad->fd);
-        free(ad);
-        return NULL;
+    for (int i = 0; i < ad->n; i++) {
+        ad->usage[i] = cfg->analog.hid[i] >= 0
+                       ? (uint16_t)cfg->analog.hid[i]
+                       : usage_of_key[cfg->pool[i]];
+        if (!ad->usage[i]) {
+            LOG_ERR("could not resolve %s to a HID usage id - run with -A to "
+                    "find it, then set it in analog.hid",
+                    key_name_or(cfg->pool[i]));
+            close(ad->fd);
+            free(ad);
+            return NULL;
+        }
+        for (int j = 0; j < i; j++) {
+            if (ad->usage[j] == ad->usage[i]) {
+                LOG_ERR("%s and %s both resolve to HID usage 0x%02x - one of "
+                        "them needs an explicit analog.hid entry",
+                        key_name_or(cfg->pool[j]), key_name_or(cfg->pool[i]),
+                        ad->usage[i]);
+                close(ad->fd);
+                free(ad);
+                return NULL;
+            }
+        }
     }
 
     g_analog_vid = ad->vid;
     g_analog_pid = ad->pid;
 
-    LOG_INFO("Analog input on %s (%s, %04x:%04x): k1 -> hid 0x%02x, "
-             "k2 -> hid 0x%02x", ad->path,
-             ad->fmt == ANALOG_FMT_V2 ? "v2" : "v1", ad->vid, ad->pid,
-             ad->usage[0], ad->usage[1]);
+    char keydesc[POOL_MAX * 28];
+    size_t ko = 0;
+    for (int i = 0; i < ad->n && ko < sizeof(keydesc); i++)
+        ko += (size_t)snprintf(keydesc + ko, sizeof(keydesc) - ko,
+                               "%s%s->0x%02x%s", i ? ", " : "",
+                               key_name_or(cfg->pool[i]), ad->usage[i],
+                               (i == ad->latch[0] || i == ad->latch[1])
+                               ? "*" : "");
+    LOG_INFO("Analog input on %s (%s, %04x:%04x): %s  (* = deep latch pair)",
+             ad->path, ad->fmt == ANALOG_FMT_V2 ? "v2" : "v1",
+             ad->vid, ad->pid, keydesc);
     LOG_INFO("Analog thresholds: actuation %.2fmm, release %.2fmm "
              "(derived), backplate at %.2fmm, rapid trigger %s",
              (double)cfg->analog.actuation_mm, (double)cfg->analog.release_mm,
@@ -1754,6 +2060,24 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
                  (double)cfg->analog.rt_release_mm);
     }
     return ad;
+}
+
+/* Bring an analog_dev_t up as a bare two-key pool, with no hidraw node
+ * behind it. tools/replay.c and tools/regimetest.c drive the analog
+ * front-end directly and need exactly this much of analog_dev_open.
+ *
+ * It is not a memset: pool_init seeds each key's slot by index, and a
+ * zeroed pool_state_t would put both keys in slot 0, so the second key's
+ * press would come out as v1. */
+__attribute__((unused))
+static void analog_dev_stub(analog_dev_t *ad) {
+    memset(ad, 0, sizeof(*ad));
+    ad->kind     = EP_ANALOG;
+    ad->fd       = -1;
+    ad->n        = 2;
+    ad->latch[0] = 0;
+    ad->latch[1] = 1;
+    pool_init(&ad->pool, ad->n);
 }
 
 static void analog_dev_close(analog_dev_t *ad) {
@@ -1827,10 +2151,14 @@ static int analog_trace(const oid_config_t *cfg, const char *input_dir) {
         analog_sample_t s[ANALOG_SLOTS];
         int             ns = analog_decode(ad->fmt, buf, (size_t)n, s,
                                            ANALOG_SLOTS);
+        /* The LATCH PAIR only, whatever the pool's size. The trace format is
+         * `us,k1_mm,k2_mm` and every recorded trace under tests/ is in it; widening
+         * this would invalidate the corpus to record keys that cannot arm
+         * the latch anyway. */
         float depth[2] = { 0.0f, 0.0f };
         for (int i = 0; i < ns; i++)
             for (int k = 0; k < 2; k++)
-                if (s[i].code == ad->usage[k])
+                if (s[i].code == ad->usage[ad->latch[k]])
                     depth[k] = s[i].depth * cfg->analog.travel_mm;
 
         printf("%lld,%.4f,%.4f\n", us, (double)depth[0], (double)depth[1]);
@@ -2041,14 +2369,17 @@ enum { S_NONE = 0, S_RELEASE = 1, S_SINGLE = 2, S_PRESS = 3 };
  * process_event() below feeds it real key events, analog_drive() feeds it
  * edges derived from travel depth. The transition logic is identical either
  * way, which is the point. */
-static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
+static int socd_apply(socd_state_t *in, int slot, int value, int mode,
                       const oid_config_t *cfg) {
+    int is_k1 = (slot == 0);
     in->mode = mode;
 
     if (mode == SOCD_OFF) {
-        /* k1/k2 still tracked so release_stuck can clean up a dying device.
-         * Each key maps 1:1 to its own voice; both may sound if both are
-         * pressed (they play on independent streams). */
+        /* Slot occupancy still tracked so release_stuck can clean up a
+         * dying device. Each slot maps 1:1 to its own voice; both may sound
+         * if both are pressed (they play on independent streams).
+         * Autorepeat is deliberately forwarded here - see the value == 2
+         * bail below, which applies only to the state machine. */
         if (value != 2) {
             if (is_k1) in->k1 = value;
             else       in->k2 = value;
@@ -2113,17 +2444,69 @@ static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
     return triggered;
 }
 
-/* evdev entry point: mirror everything that isn't k1/k2, and hand k1/k2 to
- * the SOCD core. In analog mode this device's k1/k2 are driven from travel
- * depth instead, so the digital copies are dropped here to avoid emitting
- * each press twice. */
+/* Feed one physical key edge for pool index `i` through the slot layer.
+ *
+ * Only 0<->1 occupancy crossings reach the core, which is what lets a slot
+ * hold more than one key without inventing edges: the second key to arrive
+ * in a slot is already represented there, and its release is not a release
+ * of the slot.
+ *
+ * Autorepeat (value == 2) is passed straight through on the key's recorded
+ * slot without touching the counts. That is not a no-op: SOCD_OFF forwards
+ * autorepeat to v1/v2 verbatim, and always has. Filtering it here would
+ * quietly change `off` mode. The state-machine modes drop it inside
+ * socd_apply, exactly as before. */
+static int pool_feed(pool_state_t *p, int i, int value, int mode,
+                     const oid_config_t *cfg) {
+    if (value == 2) {
+        if (!p->key[i].held) return VOICE_NONE;
+        return socd_apply(&p->socd, p->key[i].slot, 2, mode, cfg);
+    }
+
+    if (value) {
+        if (p->key[i].held) return VOICE_NONE;   /* duplicate press */
+        int alternating = (cfg->socd == SOCD_OFF && cfg->n_pool > 2);
+        int s = pool_pick_slot(p, i, alternating);
+        p->key[i].held = 1;
+        p->key[i].slot = s;
+        p->last_slot   = s;
+        p->count[s]++;
+        /* A press ALWAYS reaches the core, even when it joins a slot that
+         * was already occupied - which happens only when both slots were
+         * taken, since pool_pick_slot prefers a free one. That is the third
+         * simultaneous key, and it must still be worth a note: socd_apply
+         * reads slot occupancy as already-1 and this as a second key going
+         * down, which is S_PRESS, so the toggle alternates exactly as it
+         * would for any other press. Gating this on the 0<->1 crossing the
+         * way releases are gated would silently swallow it. */
+        return socd_apply(&p->socd, s, 1, mode, cfg);
+    }
+
+    /* A release for a key we never saw press - a SYNC drop, or a key held
+     * across the grab - has no slot to act on. Drop it rather than guess:
+     * guessing writes an up for a virtual nobody pressed. */
+    if (!p->key[i].held) return VOICE_NONE;
+    p->key[i].held = 0;
+    int s = p->key[i].slot;
+    /* Releases ARE gated on the crossing, unlike presses. A slot with a key
+     * still in it has not been released, and writing an up for it would
+     * kill a hold the player is still making. */
+    if (--p->count[s] != 0)
+        return VOICE_NONE;
+    return socd_apply(&p->socd, s, 0, mode, cfg);
+}
+
+/* evdev entry point: mirror everything that isn't a pool key, and hand pool
+ * keys to the slot layer. In analog mode this device's pool keys are driven
+ * from travel depth instead, so the digital copies are dropped here to
+ * avoid emitting each press twice. */
 static int process_event(input_dev_t *in, const struct input_event *ie,
                          const oid_config_t *cfg) {
     if (ie->type == EV_MSC && ie->code == MSC_SCAN)
         return VOICE_NONE;
 
-    if (ie->type != EV_KEY ||
-        (ie->code != (unsigned)cfg->k1 && ie->code != (unsigned)cfg->k2)) {
+    int i = ie->type == EV_KEY ? pool_index(cfg, ie->code) : -1;
+    if (i < 0) {
         libevdev_uinput_write_event(uidev, ie->type, ie->code, ie->value);
         return VOICE_NONE;
     }
@@ -2131,8 +2514,7 @@ static int process_event(input_dev_t *in, const struct input_event *ie,
     if (in->analog)
         return VOICE_NONE;
 
-    return socd_apply(&in->socd, ie->code == (unsigned)cfg->k1, ie->value,
-                      cfg->socd, cfg);
+    return pool_feed(&in->pool, i, ie->value, cfg->socd, cfg);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2225,17 +2607,91 @@ static void analog_deep_set(analog_dev_t *ad, int on,
      * would press a key for a finger that left on this very sample, then
      * release it again when the edge lands: a phantom note on the way out
      * of a rock. */
-    int cur[2]  = { ad->socd.k1, ad->socd.k2 };
-    int next[2] = { ad->keys.key[0].live, ad->keys.key[1].live };
+    int cur[2] = { ad->pool.socd.k1, ad->pool.socd.k2 };
     int from[2], to[2];
 
-    socd_virtual_state(cur, ad->socd.act,
+    socd_virtual_state(cur, ad->pool.socd.act,
                        ad->deep ? cfg->socd : SOCD_OFF, from);
 
     if (on) {
-        int keep = ad->last_press;
+        /* EVICT every non-latch pool key from the slot bookkeeping before
+         * computing anything. Parking their front-ends is not enough, and
+         * both failures are silent.
+         *
+         * It would BLIND THE TOGGLE. A non-latch key sharing a latch key's
+         * slot leaves that slot's count at 2. When the latch key then lifts
+         * off the backplate the count goes 2->1, there is no 0<->1
+         * crossing, and socd_apply never sees the release - the ride emits
+         * nothing at all.
+         *
+         * It would also STRAND THE KEY: `held` would stay set for a key
+         * nothing is feeding, so its first press after disarm is swallowed
+         * as a duplicate.
+         *
+         * `slot` is deliberately left alone, so stickiness survives the
+         * armed window. With a two-key pool there are no non-latch keys and
+         * this whole loop is a no-op. */
+        for (int k = 0; k < ad->n; k++) {
+            if (k == ad->latch[0] || k == ad->latch[1]) continue;
+            if (ad->pool.key[k].held) {
+                ad->pool.key[k].held = 0;
+                ad->pool.count[ad->pool.key[k].slot]--;
+            }
+            ad->keys.key[k].live = 0;
+        }
+
+        /* CANONICALISE the latch pair onto one slot each. They can arrive
+         * sharing one: press a non-latch key second and it takes the free
+         * slot, so the second latch key finds both held and shares off
+         * `!last_slot`. Evicting the interloper then leaves both latch keys
+         * in one slot and the other empty - and from there every backplate
+         * crossing for the rest of the rock is a 2<->1 move inside that one
+         * slot. No 0<->1 crossing means socd_apply is never called, and the
+         * ride is dead until the latch disarms.
+         *
+         * Safe to do here because eviction has already run, so the only
+         * held keys are these two and the picture is fully determined.
+         * `from[]` was captured before any of this, so whatever moves comes
+         * out in the from->to difference below. A two-key pool can never
+         * reach this - two keys never share a slot - so the corpus is
+         * untouched. regimetest case R. */
+        int a = ad->latch[0], b = ad->latch[1];
+        if (ad->pool.key[a].slot == ad->pool.key[b].slot) {
+            int was = ad->pool.key[b].slot;
+            ad->pool.key[b].slot = !was;
+            if (ad->pool.key[b].held) {
+                ad->pool.count[was]--;
+                ad->pool.count[!was]++;
+            }
+        }
+
+        ad->pool.socd.k1 = ad->pool.count[0] > 0;
+        ad->pool.socd.k2 = ad->pool.count[1] > 0;
+    }
+
+    /* Where the virtual keys should END UP. Slot occupancy after the
+     * transition, built from the front-end's `live` - this sample's truth -
+     * rather than from socd, which lags it by whatever edges have not been
+     * routed yet. Only the latch pair survives arming; nothing survives
+     * disarming. */
+    int next[2] = { 0, 0 };
+    if (on) {
+        for (int i = 0; i < 2; i++)
+            if (ad->keys.key[ad->latch[i]].live)
+                next[ad->pool.key[ad->latch[i]].slot] = 1;
+    }
+
+    if (on) {
+        /* Resolved to a slot HERE, not when the press was recorded: the
+         * canonicalisation above may have just moved the key to the other
+         * slot, and `keep` has to name where it actually ended up. When the
+         * last press was an evicted non-latch key its slot still names one
+         * of the two, which is arbitrary but deterministic - the "last
+         * input wins" rule has nothing to say about a key that is no longer
+         * in the picture. */
+        int keep = ad->pool.key[ad->last_press].slot;
         if (!next[keep]) keep = !keep;      /* it lifted; the other has it */
-        ad->socd.act = (keep == 0);
+        ad->pool.socd.act = (keep == 0);
     } else {
         /* PARK both front ends on the way out. Disarming means neither key
          * is on the floor, so nothing is held - but a key can still be well
@@ -2253,13 +2709,21 @@ static void analog_deep_set(analog_dev_t *ad, int on,
          * key tracks its extreme on the way up, emits nothing, and re-presses
          * only on a real stroke - a bottom-out, or press_mm of down-travel.
          * analog_key_feed's riding branch leaves rt_extreme parked for
-         * exactly this handoff. */
-        for (int k = 0; k < 2; k++)
+         * exactly this handoff.
+         *
+         * EVERY pool key is parked, not just the latch pair. The non-latch
+         * keys were evicted and left unfed for the whole armed window, so
+         * their `rt_extreme` is stale by however long the rock lasted;
+         * analog_drain re-anchors it to the current sample as it resumes
+         * feeding them. Parked is the state that emits nothing while
+         * rising and re-presses only on a real stroke, which is exactly
+         * what a key that was silenced mid-flight needs. */
+        for (int k = 0; k < ad->n; k++)
             ad->keys.key[k].live = 0;
         next[0] = next[1] = 0;
     }
     ad->deep = on;
-    socd_virtual_state(next, ad->socd.act, on ? cfg->socd : SOCD_OFF, to);
+    socd_virtual_state(next, ad->pool.socd.act, on ? cfg->socd : SOCD_OFF, to);
 
     /* Emit the difference. BOTH directions are release-only now, which is
      * what the new disarm rule buys:
@@ -2304,6 +2768,12 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
 
     float floor_mm = a->travel_mm - a->bottom_out_mm;
 
+    /* The latch pair, and only ever a pair: whatever the pool's size, this
+     * stays the same two-key backplate test it has always been. Alt-tapping
+     * cannot satisfy it, no depth is compared against another, and nothing
+     * about the wider pool enters here. */
+    float d0 = depth[ad->latch[0]], d1 = depth[ad->latch[1]];
+
     if (ad->deep) {
         /* BOTH fingers off the floor ends it. One key leaving is a stroke,
          * not an exit - which is the whole point, and why the earlier rule
@@ -2316,10 +2786,10 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
          * early at 0.25mm instead of at 3.44mm. Two thresholds inside one
          * burst is jitter, and "how completely you lift" is exactly the kind
          * of amplitude-driven rule this design already rejects elsewhere. */
-        if (depth[0] < floor_mm && depth[1] < floor_mm) {
+        if (d0 < floor_mm && d1 < floor_mm) {
             LOG_INFO("Deep latch cleared: k1 %.2fmm, k2 %.2fmm - both off "
                      "the backplate (%.2fmm), back to the plain remap",
-                     (double)depth[0], (double)depth[1], (double)floor_mm);
+                     (double)d0, (double)d1, (double)floor_mm);
             analog_deep_set(ad, 0, cfg);
         }
         return;
@@ -2342,7 +2812,7 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
      * a debounce counter. "One consecutive sample" IS the instantaneous
      * test; if a longer confirmation is ever wanted it wraps this test and
      * nothing else moves. */
-    if (depth[0] >= floor_mm && depth[1] >= floor_mm) {
+    if (d0 >= floor_mm && d1 >= floor_mm) {
         /* Logged because arming is otherwise INVISIBLE: it is release-only
          * by construction, it never clicks, and the first dip out of it
          * reverts through two writes the kernel drops. With no trace of it
@@ -2352,7 +2822,7 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
          * Transitions are once per rock, not per report. */
         LOG_INFO("Deep latch ARMED: k1 %.2fmm, k2 %.2fmm both at or past "
                  "the backplate (%.2fmm) - SOCD toggle engaged",
-                 (double)depth[0], (double)depth[1], (double)floor_mm);
+                 (double)d0, (double)d1, (double)floor_mm);
         analog_deep_set(ad, 1, cfg);
     }
 }
@@ -2360,7 +2830,7 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
 /* Route one synthesized edge into the SOCD core under whatever mode the
  * `deep` latch selects. The latch itself is resolved once per sample in
  * analog_drain, before any of that sample's edges are applied. */
-static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
+static int analog_socd_edge(analog_dev_t *ad, int idx, int value,
                             const oid_config_t *cfg) {
     /* cfg->socd is SOCD_ANALOG here; socd_apply special-cases only OFF and
      * SNAPPY, so ANALOG runs the toggle path. Deliberate, not accidental. */
@@ -2382,19 +2852,23 @@ static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
      * down(!act) always a real press, whichever finger moves. So the choice
      * at arming is genuinely arbitrary, `act_bound` is gone, and so is the
      * cycle that used to repair the no-op. */
-    int held[2] = { ad->socd.k1, ad->socd.k2 };
+    int held[2] = { ad->pool.socd.k1, ad->pool.socd.k2 };
     int before[2];
-    socd_virtual_state(held, ad->socd.act, mode, before);
+    socd_virtual_state(held, ad->pool.socd.act, mode, before);
 
+    int voice = pool_feed(&ad->pool, idx, value, mode, cfg);
+
+    /* Recorded AFTER the feed, because the slot layer is what decides which
+     * slot this key drives - reading it before would name the slot the key
+     * held last time. It is a slot rather than a key index because
+     * analog_deep_set compares it against slot occupancy. */
     if (value == 1)
-        ad->last_press = is_k1 ? 0 : 1;
-
-    int voice = socd_apply(&ad->socd, is_k1, value, mode, cfg);
+        ad->last_press = idx;
 
     int after[2];
-    held[0] = ad->socd.k1;
-    held[1] = ad->socd.k2;
-    socd_virtual_state(held, ad->socd.act, mode, after);
+    held[0] = ad->pool.socd.k1;
+    held[1] = ad->pool.socd.k2;
+    socd_virtual_state(held, ad->pool.socd.act, mode, after);
 
     /* Claim a click only when the virtual picture actually moved. Under the
      * backplate rule every toggle transition does, so this no longer has a
@@ -2408,11 +2882,75 @@ static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
     return voice;
 }
 
+/* Which voice a report claimed. Indirected through a macro purely so
+ * tools/regimetest.c can observe it: defining it over audio_trigger itself
+ * would rewrite that function's own definition, which the tools compile too.
+ * Nothing else should redefine this. */
+#ifndef ANALOG_CLICK
+#define ANALOG_CLICK(voice) audio_trigger((voice) - 1)
+#endif
+
+/* Turn ONE report's worth of depths into SOCD edges. Split out of
+ * analog_drain so that tools/replay.c and tools/regimetest.c drive this
+ * exact function instead of reimplementing the ordering - the skip-while-
+ * armed, the latch resolution, the re-anchor at disarm and the edge routing
+ * all have to happen in this order, and a copy in the tools would be free
+ * to drift from the daemon while still passing its own assertions. */
+static void analog_report(analog_dev_t *ad, const oid_config_t *cfg,
+                          const float *depth) {
+    /* Feed every key before judging any: engagement and lapse read the
+     * deep/live state of the latch pair, which is only complete once both
+     * have been fed. The latch is then resolved BEFORE this sample's edges
+     * are applied, so every edge runs under the mode actually in force for
+     * it. That ordering is what stops the lift ending a rock from being
+     * reverted by a toggle on its way out - the release lands as a plain
+     * release, and the reconciliation in analog_deep_set has already put
+     * the virtual keys where OFF expects them. */
+    int edges[POOL_MAX][2], ne[POOL_MAX] = { 0 };
+    int was_deep = ad->deep;
+    for (int k = 0; k < ad->n; k++) {
+        int is_latch = (k == ad->latch[0] || k == ad->latch[1]);
+        /* While armed, non-latch keys are not fed AT ALL. Feeding them
+         * and dropping the edges would leave the front-end `live`, and
+         * the parked state they are meant to sit in exists precisely to
+         * re-press on the next real stroke - which is what must not
+         * happen while the rock owns both virtuals. They resume below,
+         * re-anchored, once the latch clears. */
+        if (was_deep && !is_latch)
+            continue;
+        /* Riding is a property of the latch pair. Nothing else is on the
+         * backplate by definition of the latch, and nothing else is
+         * being fed while it is armed. */
+        ne[k] = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
+                                was_deep && is_latch, edges[k]);
+    }
+
+    analog_deep_update(ad, cfg, depth);
+
+    /* Re-anchor the keys that were silenced, now that they are fed
+     * again. Their rt_extreme is as stale as the rock was long, and
+     * rule 2 would read the gap between it and the current depth as a
+     * reversal. Anchoring on the present sample with `live` already
+     * clear is analog_deep_set's parked state: silent while rising,
+     * re-pressing only on a real stroke. */
+    if (was_deep && !ad->deep)
+        for (int k = 0; k < ad->n; k++)
+            if (k != ad->latch[0] && k != ad->latch[1])
+                ad->keys.key[k].rt_extreme = depth[k];
+
+    for (int k = 0; k < ad->n; k++)
+        for (int e = 0; e < ne[k]; e++) {
+            int voice = analog_socd_edge(ad, k, edges[k][e], cfg);
+            if (voice != VOICE_NONE)
+                ANALOG_CLICK(voice);
+        }
+}
+
 /* Read every queued analog report and turn travel depth into SOCD edges.
  * A key absent from a report is at rest, so each frame is a complete
- * picture rather than a delta: resolve the current depth of k1/k2, feed
- * both to the front-end, and route whatever edges come back through the
- * same core the evdev path uses. Returns -1 if the device died. */
+ * picture rather than a delta: resolve the current depth of every pool
+ * key, then hand the frame to analog_report. Returns -1 if the device
+ * died. */
 static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
     for (;;) {
         unsigned char buf[ANALOG_V2_REPORT];
@@ -2430,34 +2968,13 @@ static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
         int             ns = analog_decode(ad->fmt, buf, (size_t)n, s,
                                            ANALOG_SLOTS);
 
-        float depth[2] = { 0.0f, 0.0f };
+        float depth[POOL_MAX] = { 0.0f };
         for (int i = 0; i < ns; i++)
-            for (int k = 0; k < 2; k++)
+            for (int k = 0; k < ad->n; k++)
                 if (s[i].code == ad->usage[k])
                     depth[k] = s[i].depth * cfg->analog.travel_mm;
 
-        /* Feed both keys before judging either: engagement and lapse read
-         * the deep/live state of BOTH, which is only complete once both
-         * have been fed. The latch is then resolved BEFORE this sample's
-         * edges are applied, so every edge runs under the mode actually in
-         * force for it. That ordering is what stops the lift ending a
-         * rock from being reverted by a toggle on its way out - the
-         * release lands as a plain release, and the reconciliation in
-         * analog_deep_set has already put the virtual keys where OFF
-         * expects them. */
-        int edges[2][2], ne[2];
-        for (int k = 0; k < 2; k++)
-            ne[k] = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
-                                    ad->deep, edges[k]);
-
-        analog_deep_update(ad, cfg, depth);
-
-        for (int k = 0; k < 2; k++)
-            for (int e = 0; e < ne[k]; e++) {
-                int voice = analog_socd_edge(ad, k == 0, edges[k][e], cfg);
-                if (voice != VOICE_NONE)
-                    audio_trigger(voice - 1);
-            }
+        analog_report(ad, cfg, depth);
     }
     return 0;
 }
@@ -2609,7 +3126,7 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                     analog_drain(ad, cfg) < 0) {
                     LOG_WARN("analog device %s gone; falling back to the "
                              "digital path", ad->path);
-                    release_stuck(&ad->socd, cfg);
+                    release_stuck(&ad->pool.socd, cfg);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, ad->fd, NULL);
                     g_analog_vid = g_analog_pid = 0;
                     for (size_t d = 0; d < devs->n; d++)
@@ -2633,7 +3150,7 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
             }
 
             if (dead) {
-                release_stuck(&in->socd, cfg);
+                release_stuck(&in->pool.socd, cfg);
                 epoll_ctl(epfd, EPOLL_CTL_DEL, in->fd, NULL);
                 dev_list_remove(devs, in);
                 input_close(in);
@@ -2765,8 +3282,6 @@ main(int argc, char **argv) {
         return rc;
     }
 
-    const char *k1n = libevdev_event_code_get_name(EV_KEY, cfg.k1);
-    const char *k2n = libevdev_event_code_get_name(EV_KEY, cfg.k2);
     const char *v1n = libevdev_event_code_get_name(EV_KEY, cfg.v1);
     const char *v2n = libevdev_event_code_get_name(EV_KEY, cfg.v2);
     char devdesc[32];
@@ -2774,10 +3289,18 @@ main(int argc, char **argv) {
         snprintf(devdesc, sizeof(devdesc), "auto-discover");
     else
         snprintf(devdesc, sizeof(devdesc), "%zu device(s)", cfg.n_devices);
-    LOG_INFO("Config: %s, keys k1=%s(%d) k2=%s(%d) "
+    char pooldesc[POOL_MAX * 24];
+    size_t po = 0;
+    for (int i = 0; i < cfg.n_pool && po < sizeof(pooldesc); i++)
+        po += (size_t)snprintf(pooldesc + po, sizeof(pooldesc) - po, "%s%s%s",
+                               i ? " " : "", key_name_or(cfg.pool[i]),
+                               (cfg.socd == SOCD_ANALOG &&
+                                (i == cfg.latch[0] || i == cfg.latch[1]))
+                               ? "*" : "");
+    LOG_INFO("Config: %s, pool [%s]%s -> "
              "v1=%s(%d) v2=%s(%d), socd=%s, audio=%s",
-             devdesc,
-             k1n ? k1n : "?", cfg.k1, k2n ? k2n : "?", cfg.k2,
+             devdesc, pooldesc,
+             cfg.socd == SOCD_ANALOG ? " (* = deep latch pair)" : "",
              v1n ? v1n : "?", cfg.v1, v2n ? v2n : "?", cfg.v2,
              cfg.socd == SOCD_SNAPPY ? "snappy"
                  : cfg.socd == SOCD_OFF    ? "off"

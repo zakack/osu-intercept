@@ -139,24 +139,21 @@ static void replay_emit(unsigned type, unsigned code, int value) {
 static void replay_run(const trace_t *tr, const oid_config_t *cfg,
                        run_t *out) {
     analog_dev_t ad;
-    memset(&ad, 0, sizeof(ad));
+    analog_dev_stub(&ad);
     memset(&g_run, 0, sizeof(g_run));
     memset(g_vkey, 0, sizeof(g_vkey));   /* the sweep re-runs this pass */
     g_run.first_engage_us = -1;
     g_log_quiet = 1;                     /* -v lists the latches instead */
 
     for (size_t i = 0; i < tr->n; i++) {
-        int   edges[2][2], ne[2];
         int   was = ad.deep;
         g_now_us = tr->f[i].us;
 
-        for (int k = 0; k < 2; k++)
-            ne[k] = analog_key_feed(&ad.keys, k, tr->f[i].mm[k],
-                                    &cfg->analog, ad.deep, edges[k]);
-        analog_deep_update(&ad, cfg, tr->f[i].mm);
-        for (int k = 0; k < 2; k++)
-            for (int e = 0; e < ne[k]; e++)
-                analog_socd_edge(&ad, k == 0, edges[k][e], cfg);
+        /* The daemon's own per-report path, not a restatement of it - the
+         * ordering inside analog_report is load-bearing and a copy here
+         * would be free to drift while still passing replay's own checks. */
+        float depth[POOL_MAX] = { tr->f[i].mm[0], tr->f[i].mm[1] };
+        analog_report(&ad, cfg, depth);
 
         if (!was && ad.deep) {
             g_run.engagements++;
