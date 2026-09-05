@@ -85,7 +85,7 @@ audio:
 # The switch between them is the `deep` latch:
 #
 #   ARMS   when BOTH keys are on the backplate in one report -> toggle
-#   DISARMS when EITHER key comes back up past actuation_mm  -> off
+#   DISARMS when BOTH keys are off the backplate             -> off
 #
 # Planting both keys is the rock and nothing else is: alt-tapping's defining
 # shape is one finger leaving as the other arrives, so the two are never on
@@ -103,9 +103,19 @@ audio:
 # other is tapped is NOT treated as anything special; the two keys' depths
 # are never compared against each other.
 #
-# Rapid trigger runs two profiles, picked by whether the latch is armed -
-# not by any depth. Riding uses deep_press_mm/deep_release_mm, tapping uses
-# press_mm/release_mm.
+# While the latch is armed the backplate IS the switch: a key counts as down
+# while it is against the floor and up as soon as it leaves, and rapid trigger
+# does not run at all. That is what riding already is - you bottom out every
+# stroke - so every note in a burst lands on the same hard physical line
+# instead of at whatever depth a reversal distance happened to fall.
+#
+# It also means ONE finger lifting clear does not end the latch. In a burst a
+# finger routinely comes right off the switch while the other stays planted;
+# ending the latch there would send the next note through the tapping profile
+# at actuation_mm, landing it early. Only both fingers leaving the floor ends
+# it, and that release is silent.
+#
+# Rapid trigger (press_mm/release_mm) therefore applies to TAPPING only.
 #
 # Run `doubletapd -A` to watch live travel depth and pick numbers against
 # your own hands, or `doubletapd -T > s.csv` to record a session and replay
@@ -119,25 +129,18 @@ audio:
 # analog:
 #   device: auto          # or an explicit /dev/hidrawN
 #   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
-#   actuation_mm: 1.0     # press threshold, and what DISARMS the latch
+#   actuation_mm: 1.0     # press threshold while TAPPING. Not used while
+#                         # riding, where the backplate is the switch.
 #   rapid_trigger:
 #     enabled: true
 #     press_mm: 0.3       # downward reversal that re-presses  } tapping
-#     release_mm: 0.3     # upward reversal that releases      } zone
-#     deep_press_mm: off  # while riding. "off" means the backplate is the
-#                         # ONLY thing that re-presses - the setting
-#                         # Wootility will not let you express, and the one
-#                         # a rocking style wants. Unset mirrors press_mm.
-#     deep_release_mm: 0.3  # while riding. "off" holds the key until a full
-#                         # release, which is how Keychron's bottom dead
-#                         # zone behaves - be aware it also means a rock
-#                         # emits nothing, since the beats come from the
-#                         # release/re-press pair. Unset mirrors release_mm.
+#     release_mm: 0.3     # upward reversal that releases      } only
 #     bottom_out_mm: 0.2  # where the backplate starts, measured from full
 #                         # travel: 0.2 on a 4.0mm switch = 95%. Bottoming
 #                         # out always presses however small the
-#                         # down-travel, AND both keys reaching it at once
-#                         # is what arms the deep latch. Must be > 0; keep
+#                         # down-travel, it is what arms the deep latch when
+#                         # both keys reach it, and while the latch is armed
+#                         # it is the ONLY threshold. Must be > 0; keep
 #                         # it under ~10% of travel, or a firm tap can
 #                         # reach it and alt-tapping may arm the latch.
 #   hid_k1: auto          # HID usage ids; derived from the keyboard's own

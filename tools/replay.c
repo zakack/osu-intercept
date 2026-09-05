@@ -93,7 +93,8 @@ static int trace_load(const char *path, trace_t *tr) {
 
 typedef struct {
     unsigned  engagements;
-    unsigned  presses;          /* virtual key-downs emitted */
+    unsigned  presses;          /* virtual key-downs the kernel passes on */
+    unsigned  dropped;          /* no-change writes the kernel swallows */
     long long first_engage_us;
 } run_t;
 
@@ -101,9 +102,37 @@ static run_t      g_run;
 static int        g_verbose;
 static long long  g_now_us;
 
+/* The virtual keyboard as the REST OF THE SYSTEM sees it, not as the daemon
+ * writes it.
+ *
+ * A write to /dev/uinput is not an event. It goes through the kernel's
+ * input_handle_event(), which for EV_KEY drops any 0/1 whose value already
+ * matches the key's current state - only autorepeat (2) bypasses that. The
+ * daemon leans on this on purpose: socd_apply's S_RELEASE/S_PRESS arm writes
+ * an up/down pair unconditionally, and analog_socd_edge documents that when
+ * the dipping key is the one whose virtual stepped aside as the latch armed,
+ * BOTH halves land on keys already in that state and the kernel eats them.
+ * That is called out there as "the common case, not a corner" - it is every
+ * lift out of a rock on one side.
+ *
+ * Counting raw writes therefore over-reports presses against what a reader of
+ * the virtual device actually receives, and it over-reports them precisely in
+ * the gesture this branch exists for. So mirror the filter here: replay is
+ * only worth anything if its number is the number you could have measured off
+ * the device. */
+static unsigned char g_vkey[KEY_MAX + 1];
+
 static void replay_emit(unsigned type, unsigned code, int value) {
-    (void)code;
-    if (type == EV_KEY && value == 1)
+    if (type != EV_KEY || code > KEY_MAX)
+        return;
+    if (value == 2)                     /* autorepeat bypasses the state test */
+        return;
+    if (!!g_vkey[code] == !!value) {    /* no change: the kernel drops it */
+        g_run.dropped++;
+        return;
+    }
+    g_vkey[code] = value ? 1 : 0;
+    if (value)
         g_run.presses++;
 }
 
@@ -112,7 +141,9 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
     analog_dev_t ad;
     memset(&ad, 0, sizeof(ad));
     memset(&g_run, 0, sizeof(g_run));
+    memset(g_vkey, 0, sizeof(g_vkey));   /* the sweep re-runs this pass */
     g_run.first_engage_us = -1;
+    g_log_quiet = 1;                     /* -v lists the latches instead */
 
     for (size_t i = 0; i < tr->n; i++) {
         int   edges[2][2], ne[2];
@@ -137,7 +168,160 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
                        (double)tr->f[i].mm[1]);
         }
     }
+    g_log_quiet = 0;
     *out = g_run;
+}
+
+/* ------------------------------------------------------------------------ */
+/* fidelity: did the trace get every report the daemon did?                  */
+/* ------------------------------------------------------------------------ */
+
+/* A trace is only a stand-in for the daemon if it holds every report the
+ * daemon drained, and -T cannot promise that.
+ *
+ * Both read the same hidraw node, but hidraw hands each client its own ring
+ * of 64 reports and overwrites the oldest when the client falls behind - no
+ * error, no short read, nothing the tracer can notice. The daemon runs at
+ * SCHED_FIFO 90; -T is an ordinary process, and if stdout is a terminal it
+ * pays a write() per report on top. At the ~1kHz these boards report, 64
+ * reports is 64ms of slack: one scheduling hiccup while a game is running and
+ * the trace quietly loses a stretch the daemon saw in full.
+ *
+ * That is not a cosmetic hole. analog_key_feed carries `rt_extreme` from
+ * sample to sample, so missing samples move where reversals fire, and
+ * analog_deep_update wants both keys on the backplate in ONE report - drop
+ * that report and the latch the daemon really armed never appears here.
+ * A replay off a holey trace disagrees with the live daemon and looks like a
+ * state-machine bug.
+ *
+ * The timestamps are the evidence, so read them. Cadence comes from the
+ * median interval rather than the mean, which a single long pause would drag
+ * anywhere. */
+static int cmp_ll(const void *a, const void *b) {
+    long long x = *(const long long *)a, y = *(const long long *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static void report_gaps(const trace_t *tr, const oid_config_t *cfg) {
+    if (tr->n < 3)
+        return;
+
+    size_t     nd = tr->n - 1;
+    long long *d  = malloc(nd * sizeof(*d));
+    if (!d)
+        return;
+    for (size_t i = 0; i < nd; i++)
+        d[i] = tr->f[i + 1].us - tr->f[i].us;
+    qsort(d, nd, sizeof(*d), cmp_ll);
+
+    long long med = d[nd / 2];
+    free(d);
+    if (med <= 0)
+        return;
+
+    /* Four missed reports in a row is well past jitter and still far short of
+     * the 64 it takes to be certain, so it errs toward telling you. The 5ms
+     * floor keeps a slow-reporting board from tripping on ordinary spacing. */
+    long long limit = med * 5;
+    if (limit < 5000) limit = 5000;
+
+    /* Only a gap with a key ENGAGED ACROSS IT is evidence of loss. The board
+     * reports a key while it is off the rest position and stops when it is
+     * not, so the long stretches between gestures - the player pausing
+     * between one burst and the next - are silence the hardware never sent,
+     * not reports the tracer missed. Counting those flags every ordinary
+     * recording as damaged, which trains you to ignore the one warning that
+     * would have mattered. */
+    float least = cfg->analog.actuation_mm;
+    if (cfg->analog.rt_enabled) {
+        if (cfg->analog.rt_press_mm   > 0.0f && cfg->analog.rt_press_mm   < least)
+            least = cfg->analog.rt_press_mm;
+        if (cfg->analog.rt_release_mm > 0.0f && cfg->analog.rt_release_mm < least)
+            least = cfg->analog.rt_release_mm;
+    }
+
+    unsigned  ngap = 0;
+    long long worst = 0, lost = 0;
+    for (size_t i = 0; i + 1 < tr->n; i++) {
+        long long delta = tr->f[i + 1].us - tr->f[i].us;
+        if (delta <= limit)
+            continue;
+        float a = tr->f[i].mm[0]     > tr->f[i].mm[1]
+                ? tr->f[i].mm[0]     : tr->f[i].mm[1];
+        float b = tr->f[i + 1].mm[0] > tr->f[i + 1].mm[1]
+                ? tr->f[i + 1].mm[0] : tr->f[i + 1].mm[1];
+        if (a < cfg->analog.release_mm || b < cfg->analog.release_mm)
+            continue;                   /* idle either side: nothing was sent */
+
+        /* Nor does a key merely being HELD prove a report was lost. The
+         * board reports on change, so a finger resting on the backplate
+         * sends nothing for as long as it stays there - the gaps in an
+         * ordinary recording are mostly this. Loss only matters if travel
+         * went unobserved across the gap, and only if enough of it went
+         * unobserved to have changed a decision: every threshold the front
+         * end tests is at least `least`, so a gap hiding less movement than
+         * that could not have altered the outcome however long it lasted. */
+        float m0 = fabsf(tr->f[i + 1].mm[0] - tr->f[i].mm[0]);
+        float m1 = fabsf(tr->f[i + 1].mm[1] - tr->f[i].mm[1]);
+        if ((m0 > m1 ? m0 : m1) < least)
+            continue;
+        ngap++;
+        lost += delta / med - 1;
+        if (delta > worst) worst = delta;
+    }
+
+    printf("\ntrace fidelity: %.0f Hz median (%.2fms between reports)\n",
+           1e6 / (double)med, med / 1000.0);
+    if (!ngap) {
+        printf("  no unexplained gaps - every pause is idle or a held key\n");
+        return;
+    }
+    printf("  %u gap%s over %.1fms with travel unaccounted for, worst "
+           "%.1fms, ~%lld reports missing\n",
+           ngap, ngap == 1 ? "" : "s", limit / 1000.0, worst / 1000.0, lost);
+    printf("  WARNING: -T lost reports the daemon would have seen, so this\n"
+           "  replay can disagree with the live daemon through no fault of\n"
+           "  the state machine. Re-record with stdout redirected to a FILE\n"
+           "  (not a terminal) and with less running alongside.\n");
+}
+
+/* Could this trace EVER have armed the latch, and by how much did it miss?
+ *
+ * Arming is one test - both keys at or past travel_mm - bottom_out_mm in a
+ * SINGLE report - so the whole question reduces to one number: the largest
+ * min(k1, k2) anywhere in the trace. Everything else about the trace is
+ * irrelevant to it. If that number is under the backplate the latch was
+ * unreachable, the daemon was right to stay on the plain remap, and no
+ * amount of state-machine reading will explain the "missing" toggle - the
+ * fingers, or the board's reported maximum, never got there.
+ *
+ * That last case is real and easy to miss: the firmware reports a fraction
+ * of ITS travel, so if it saturates below the configured backplate the latch
+ * cannot arm however hard you press. The number this prints is measured, so
+ * it settles that without a guess. */
+static void report_headroom(const trace_t *tr, const oid_config_t *cfg) {
+    float floor_mm = cfg->analog.travel_mm - cfg->analog.bottom_out_mm;
+    float best = 0.0f;
+
+    for (size_t i = 0; i < tr->n; i++) {
+        float lo = tr->f[i].mm[0] < tr->f[i].mm[1]
+                 ? tr->f[i].mm[0] : tr->f[i].mm[1];
+        if (lo > best) best = lo;
+    }
+
+    printf("  deepest both keys ever were together: %.2fmm "
+           "(backplate %.2fmm)\n", (double)best, (double)floor_mm);
+    if (best >= floor_mm)
+        return;
+    printf("  the latch was UNREACHABLE in this trace - short by %.2fmm. "
+           "Either\n"
+           "  the keys were never both bottomed in one report, or the board "
+           "reports\n"
+           "  less than full travel. bottom_out_mm would have to be >= "
+           "%.2fmm to arm\n"
+           "  on this recording.\n",
+           (double)(floor_mm - best),
+           (double)(cfg->analog.travel_mm - best));
 }
 
 /* ------------------------------------------------------------------------ */
@@ -245,13 +429,22 @@ int main(int argc, char **argv) {
     printf("%zu reports over %.1fs (%.0f Hz)\n",
            tr.n, secs, secs > 0 ? tr.n / secs : 0.0);
 
+    report_gaps(&tr, &cfg);
+
     run_t r;
     printf("\nwith the config as it stands:\n");
     replay_run(&tr, &cfg, &r);
-    printf("  %u deep latch%s, %u virtual presses emitted\n",
-           r.engagements, r.engagements == 1 ? "" : "es", r.presses);
+    /* `presses` is what a reader of the virtual device receives; `dropped`
+     * is the daemon's unconditional up/down writes that the kernel swallows
+     * because the key was already in that state. Both are shown so a count
+     * taken off the real device can be reconciled against this one. */
+    printf("  %u deep latch%s, %u virtual presses emitted "
+           "(%u no-change writes dropped by the kernel)\n",
+           r.engagements, r.engagements == 1 ? "" : "es", r.presses,
+           r.dropped);
     if (r.engagements)
         printf("  first at %.3fs\n", r.first_engage_us / 1e6);
+    report_headroom(&tr, &cfg);
 
     report_style(&tr, &cfg);
 

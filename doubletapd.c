@@ -84,8 +84,18 @@
 static void logf_(const char *level, const char *fmt, ...)
 __attribute__((format(printf, 2, 3)));
 
+/* Set by the offline tools (replay, regimetest) while they push samples
+ * through the state machine. They run the same code the daemon does, so the
+ * daemon's own progress chatter comes out of them too - and replay's
+ * bottom_out sweep runs the whole trace nine times over, which turns one
+ * latch log per rock into thousands of lines across a real recording.
+ * Warnings and errors are never suppressed; only the running commentary. */
+static int g_log_quiet;
+
 static void logf_(const char *level, const char *fmt, ...) {
     va_list ap;
+    if (g_log_quiet && strcmp(level, "info") == 0)
+        return;
     fprintf(stderr, "[doubletapd] %s: ", level);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -473,9 +483,6 @@ typedef struct {
      * negative value means "unset"; analog_config_resolve fills it from
      * the tapping value, so an unconfigured daemon runs one profile.
      * 0 means the edge is disabled while riding. */
-    float  rt_deep_press_mm;   /* riding re-press; 0 == bottom-out only */
-    float  rt_deep_release_mm; /* riding release; 0 == holds until full
-                                * release (Keychron's bottom dead zone) */
     float  bottom_out_mm; /* within this of full travel == bottomed out:
                            * presses regardless of rt_press_mm, and, for
                            * both keys at once, arms `deep` */
@@ -515,8 +522,6 @@ static void config_init(oid_config_t *c) {
     c->analog.rt_enabled    = 1;
     c->analog.rt_press_mm   = 0.3f;
     c->analog.rt_release_mm = 0.3f;
-    c->analog.rt_deep_press_mm   = -1.0f;   /* unset: mirror rt_press_mm   */
-    c->analog.rt_deep_release_mm = -1.0f;   /* unset: mirror rt_release_mm */
     c->analog.bottom_out_mm = 0.20f;  /* 95% of the 4mm default travel */
     c->analog.hid_k1        = -1;   /* sentinel: derive from the keymap */
     c->analog.hid_k2        = -1;
@@ -586,23 +591,6 @@ static int parse_gain(yaml_node_t *n, float *out) {
     return 0;
 }
 
-/* A rapid-trigger reversal distance that may be switched off entirely.
- * "off" means no travel-based edge in that zone; a plain number is the
- * distance. Returns 0 on success, 1 for a literal 0 (rejected on purpose:
- * as a distance it would mean "any motion at all triggers", the exact
- * opposite of what someone writing 0 to disable it intends), -1 for junk. */
-static int parse_reversal(yaml_node_t *n, float *out) {
-    if (!n || n->type != YAML_SCALAR_NODE) return -1;
-    if (!strcasecmp((const char *)n->data.scalar.value, "off")) {
-        *out = 0.0f;
-        return 0;
-    }
-    float v;
-    if (parse_gain(n, &v) != 0) return -1;
-    if (v == 0.0f) return 1;
-    *out = v;
-    return 0;
-}
 
 /* Fill in the deep profile from the tapping profile wherever the config
  * left it unset, so everything downstream reads concrete numbers. */
@@ -615,8 +603,6 @@ static int parse_reversal(yaml_node_t *n, float *out) {
 
 static void analog_config_resolve(analog_config_t *a) {
     a->release_mm = a->actuation_mm * ANALOG_RELEASE_RATIO;
-    if (a->rt_deep_press_mm < 0.0f)   a->rt_deep_press_mm   = a->rt_press_mm;
-    if (a->rt_deep_release_mm < 0.0f) a->rt_deep_release_mm = a->rt_release_mm;
 }
 
 /* Thresholds that are individually well-formed can still combine into a
@@ -917,29 +903,12 @@ static int load_config(const char *path, oid_config_t *c) {
                         "non-negative number");
                 goto out;
             }
-            static const struct { const char *key; size_t off; } dv[] = {
-                { "deep_press_mm",
-                  offsetof(analog_config_t, rt_deep_press_mm)   },
-                { "deep_release_mm",
-                  offsetof(analog_config_t, rt_deep_release_mm) },
-            };
-            for (size_t i = 0; i < sizeof(dv) / sizeof(dv[0]); i++) {
-                yaml_node_t *v = map_get(&doc, rt, dv[i].key);
-                if (!v) continue;
-                int r = parse_reversal(
-                    v, (float *)((char *)&c->analog + dv[i].off));
-                if (r > 0) {
-                    LOG_ERR("'analog.rapid_trigger.%s' cannot be 0 - write "
-                            "\"off\" to disable it, or a distance",
-                            dv[i].key);
-                    goto out;
-                }
-                if (r < 0) {
-                    LOG_ERR("'analog.rapid_trigger.%s' must be a positive "
-                            "number or \"off\"", dv[i].key);
-                    goto out;
-                }
-            }
+            if (map_get(&doc, rt, "deep_press_mm") ||
+                map_get(&doc, rt, "deep_release_mm"))
+                LOG_WARN("'analog.rapid_trigger.deep_press_mm' and "
+                         "'deep_release_mm' were removed and are ignored - "
+                         "while riding, the backplate itself is the switch "
+                         "and no rapid trigger runs");
         }
         static const struct { const char *key; size_t off; } hid[] = {
             { "hid_k1", offsetof(analog_config_t, hid_k1) },
@@ -1489,6 +1458,35 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
     analog_key_t *self = &st->key[idx];
     int           n    = 0;
 
+    /* 0. Riding: the backplate IS the switch, and rapid trigger does not run
+     * at all.
+     *
+     * This is the whole simplification. While the latch is armed the player
+     * is bottoming out every stroke by definition - that is what riding is -
+     * so the only threshold that means anything is the floor. Synthesizing
+     * edges from reversal distances here was solving a problem the gesture
+     * does not have, and it made the note land at a different depth
+     * depending on how far the finger happened to travel.
+     *
+     * No hysteresis is needed and none is wanted: the backplate is a
+     * physical stop, so a finger is either against it (reading full travel)
+     * or off it. You cannot hover on a hard surface, which is the same
+     * property that makes the latch itself aimable.
+     *
+     * `rt_extreme` is kept at the current depth purely so the handoff OUT of
+     * riding has a sane anchor - see analog_deep_set, which clears `live` and
+     * leaves this parked, putting the key in the "engaged but not live" state
+     * the tapping profile understands. */
+    if (riding) {
+        int on = depth_mm >= cfg->travel_mm - cfg->bottom_out_mm;
+        self->rt_extreme = depth_mm;
+        if (on != self->live) {
+            self->live = on;
+            out[n++]   = on;
+        }
+        return n;
+    }
+
     /* 1. Full release: master reset. The only place that zeroes
      * `rt_extreme`. */
     if (depth_mm < cfg->release_mm) {
@@ -1499,24 +1497,13 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
         return n;
     }
 
-    /* Which rapid-trigger profile this sample runs under: the caller
-     * passes `deep`, because the latch is the gesture.
-     *
-     * An earlier revision picked the profile from the anchor against a
-     * depth. That re-decided mid-gesture: a rock that overshot the line
-     * silently switched to the tapping profile, so its return stroke
-     * re-pressed after press_mm of travel instead of waiting for the
-     * backplate, and the beat landed early on exactly the rocks that went
-     * high. Amplitude changing the rule is a limp, not a threshold.
-     *
-     * `deep` already knows. It arms when both keys are on the floor and
-     * disarms when either comes back past actuation_mm, so it is lagged by
-     * one sample here and that is harmless: the sample that arms it is a
-     * press stroke, where no reversal test runs, and the sample that
-     * disarms it is a key on its way out whose next sample runs the
-     * tapping profile anyway. */
-    float press   = riding ? cfg->rt_deep_press_mm   : cfg->rt_press_mm;
-    float release = riding ? cfg->rt_deep_release_mm : cfg->rt_release_mm;
+    /* Only the tapping profile reaches here: rule 0 returned for every
+     * riding sample, so there is one set of distances and nothing selects
+     * between them. An earlier design ran a second "deep" profile here and
+     * picked between the two by the latch; the backplate rule above replaces
+     * it outright. */
+    float press   = cfg->rt_press_mm;
+    float release = cfg->rt_release_mm;
 
     /* Against the backplate: the re-press rule below. The same line is
      * what analog_deep_update tests for BOTH keys at once, but it reads
@@ -1542,10 +1529,10 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
              * since the last reversal - the mirror of rule 1, where a full
              * release always releases however small the up-travel. Riding
              * the backplate as the neutral position depends on this: with a
-             * large press distance - or with deep_press_mm off, where the
-             * backplate is the ONLY thing that re-presses - a rock that
-             * ends against the bottom never travels far enough to satisfy
-             * the reversal test on its own. */
+             * large press distance, a stroke that ends against the bottom
+             * never travels far enough to satisfy the reversal test on its
+             * own. (While RIDING this no longer applies at all - rule 0
+             * returns before any of this.) */
             /* A re-press still has to clear actuation_mm: without that
              * floor, a reversal entirely within the top fraction of travel
              * synthesizes whole keystrokes where the sensor is least
@@ -1571,12 +1558,6 @@ static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
     return n;
 }
 
-/* Render a reversal distance for the log: "off" when disabled. */
-static const char *fmt_reversal(char *buf, size_t sz, float v) {
-    if (v <= 0.0f) return "off";
-    snprintf(buf, sz, "%.2fmm", (double)v);
-    return buf;
-}
 
 /* Find the analog interface of an analog-capable keyboard. Returns the fd
  * (and fills path/fmt), or -1 when there's nothing to open. An explicit
@@ -1711,9 +1692,6 @@ typedef struct {
     int            deep;        /* 1 == both keys planted on the backplate;
                                  * k1/k2 run the toggle instead of the
                                  * plain remap. See analog_deep_update. */
-    int            act_bound;   /* 1 == socd.act has been bound to the key
-                                 * that dipped first out of this latch.
-                                 * Cleared on every latch change. */
     int            last_press;  /* 0 == k1, 1 == k2: most recent press edge.
                                  * Picks which key keeps its virtual on when
                                  * the latch arms with both already
@@ -1766,16 +1744,14 @@ static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
              (double)(cfg->analog.travel_mm - cfg->analog.bottom_out_mm),
              cfg->analog.rt_enabled ? "on" : "off");
     LOG_INFO("SOCD engages while both keys are planted on the backplate "
-             "(deep latch); disengages when either passes %.2fmm on the "
-             "way up", (double)cfg->analog.actuation_mm);
+             "(deep latch); while engaged the backplate is the switch and "
+             "rapid trigger does not run; disengages when BOTH keys leave "
+             "the backplate - one finger lifting is a stroke, not an exit");
     if (cfg->analog.rt_enabled) {
-        char pb[16], rb[16];
-        LOG_INFO("Rapid trigger: tapping press %.2fmm release %.2fmm | "
-                 "riding press %s release %s",
+        LOG_INFO("Rapid trigger (tapping only): press %.2fmm release %.2fmm"
+                 " - while riding, the backplate is the switch",
                  (double)cfg->analog.rt_press_mm,
-                 (double)cfg->analog.rt_release_mm,
-                 fmt_reversal(pb, sizeof pb, cfg->analog.rt_deep_press_mm),
-                 fmt_reversal(rb, sizeof rb, cfg->analog.rt_deep_release_mm));
+                 (double)cfg->analog.rt_release_mm);
     }
     return ad;
 }
@@ -2260,32 +2236,51 @@ static void analog_deep_set(analog_dev_t *ad, int on,
         int keep = ad->last_press;
         if (!next[keep]) keep = !keep;      /* it lifted; the other has it */
         ad->socd.act = (keep == 0);
+    } else {
+        /* PARK both front ends on the way out. Disarming means neither key
+         * is on the floor, so nothing is held - but a key can still be well
+         * down (it need only have left the backplate), and the tapping
+         * profile is about to judge it against actuation_mm instead.
+         *
+         * Clearing `live` alone would let rule 3 read that depth as a FRESH
+         * actuation and press a finger that is on its way up - a phantom
+         * note landing exactly where a slider ends. Leaving `live` set is no
+         * better: its eventual release emits an up with no matching down,
+         * and socd_apply assumes strict alternation per key.
+         *
+         * `live = 0` with `rt_extreme` still holding the current depth is
+         * neither: it is rule 2's "engaged but not live" state, where the
+         * key tracks its extreme on the way up, emits nothing, and re-presses
+         * only on a real stroke - a bottom-out, or press_mm of down-travel.
+         * analog_key_feed's riding branch leaves rt_extreme parked for
+         * exactly this handoff. */
+        for (int k = 0; k < 2; k++)
+            ad->keys.key[k].live = 0;
+        next[0] = next[1] = 0;
     }
-    ad->deep      = on;
-    ad->act_bound = 0;   /* rebound by the first key to dip; see below */
+    ad->deep = on;
     socd_virtual_state(next, ad->socd.act, on ? cfg->socd : SOCD_OFF, to);
 
-    /* Emit the difference in whichever direction it runs.
+    /* Emit the difference. BOTH directions are release-only now, which is
+     * what the new disarm rule buys:
      *
-     * ARMING is release-only by construction: it goes from OFF's two keys
-     * down to the toggle's one. Nothing is pressed and nothing clicks, which
-     * is the whole "silent at the latch" contract - planting your fingers is
-     * not a note, and the notes for both keys already landed under OFF when
-     * they bottomed.
+     * ARMING goes from OFF's two keys down to the toggle's one. Planting is
+     * not a note, and both keys already sounded under OFF when they bottomed.
      *
-     * DISARMING may PRESS: OFF wants the still-held key's virtual back down,
-     * and without that press the hold is stranded - analog_key_feed still
-     * believes that key live, so it would only ever run the RELEASE check for
-     * it and nothing could put its virtual back. The cost is a second note
-     * for one lift, which is the cheaper of the two mistakes. */
+     * DISARMING goes from the toggle's one to none. The old rule could fire
+     * with the other finger still planted deep, so it had to PRESS to avoid
+     * stranding that hold - at the cost of a second note for one lift. Under
+     * "both off the floor" there is by definition nobody still riding, so
+     * there is no survivor to strand and nothing to press. The parked front
+     * ends above pick the keys back up on their next real stroke.
+     *
+     * The audio_trigger call that used to sit here went with it: nothing
+     * here presses, so nothing here clicks. */
     for (int k = 0; k < 2; k++) {
         if (from[k] == to[k]) continue;
         libevdev_uinput_write_event(uidev, EV_KEY,
                                     k == 0 ? cfg->v1 : cfg->v2, to[k]);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-        if (to[k])
-            audio_trigger(k);   /* a press is a press; keep the click and
-                                 * the emitted output in step */
     }
 }
 
@@ -2307,13 +2302,26 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
                                const float *depth) {
     const analog_config_t *a = &cfg->analog;
 
+    float floor_mm = a->travel_mm - a->bottom_out_mm;
+
     if (ad->deep) {
-        /* Either finger back past actuation ends it: the player has left
-         * the rock and is tapping again. Note this is actuation_mm, not
-         * release_mm - the rock is over as soon as a finger is off the key
-         * in any meaningful sense, not only once it has left the switch. */
-        if (depth[0] < a->actuation_mm || depth[1] < a->actuation_mm)
+        /* BOTH fingers off the floor ends it. One key leaving is a stroke,
+         * not an exit - which is the whole point, and why the earlier rule
+         * (either key back past actuation_mm) was wrong. In a burst a finger
+         * routinely lifts clear of the switch while the other stays planted;
+         * that tore the latch down mid-gesture, and the next note then fired
+         * off the tapping profile at actuation instead of at the backplate.
+         * Measured on tests/toggle_5burst_3phys_5virt.csv: k2 sat at 3.5000
+         * throughout while k1 lifted to 0.0000, and note 4 landed 11.9ms
+         * early at 0.25mm instead of at 3.44mm. Two thresholds inside one
+         * burst is jitter, and "how completely you lift" is exactly the kind
+         * of amplitude-driven rule this design already rejects elsewhere. */
+        if (depth[0] < floor_mm && depth[1] < floor_mm) {
+            LOG_INFO("Deep latch cleared: k1 %.2fmm, k2 %.2fmm - both off "
+                     "the backplate (%.2fmm), back to the plain remap",
+                     (double)depth[0], (double)depth[1], (double)floor_mm);
             analog_deep_set(ad, 0, cfg);
+        }
         return;
     }
 
@@ -2334,9 +2342,19 @@ static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
      * a debounce counter. "One consecutive sample" IS the instantaneous
      * test; if a longer confirmation is ever wanted it wraps this test and
      * nothing else moves. */
-    float floor_mm = a->travel_mm - a->bottom_out_mm;
-    if (depth[0] >= floor_mm && depth[1] >= floor_mm)
+    if (depth[0] >= floor_mm && depth[1] >= floor_mm) {
+        /* Logged because arming is otherwise INVISIBLE: it is release-only
+         * by construction, it never clicks, and the first dip out of it
+         * reverts through two writes the kernel drops. With no trace of it
+         * anywhere, a latch that never arms and a latch that arms and works
+         * look identical from outside - which is exactly the question you
+         * are asking when the daemon seems stuck on the plain remap.
+         * Transitions are once per rock, not per report. */
+        LOG_INFO("Deep latch ARMED: k1 %.2fmm, k2 %.2fmm both at or past "
+                 "the backplate (%.2fmm) - SOCD toggle engaged",
+                 (double)depth[0], (double)depth[1], (double)floor_mm);
         analog_deep_set(ad, 1, cfg);
+    }
 }
 
 /* Route one synthesized edge into the SOCD core under whatever mode the
@@ -2348,27 +2366,26 @@ static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
      * SNAPPY, so ANALOG runs the toggle path. Deliberate, not accidental. */
     int mode = ad->deep ? cfg->socd : SOCD_OFF;
 
-    /* Snapshot BEFORE the act binding below. `before` has to describe the
-     * virtual keys as actually written, and `act` is what names them - bind
-     * first and this snapshot describes the picture for the NEW act, which
-     * is the inverse of reality in exactly the case the gate below exists
-     * for. Do not "simplify" this by moving it down. */
+    /* `act` needs no lazy binding any more, and that is a consequence of the
+     * backplate rule rather than a separate fix.
+     *
+     * The old design had to defer it: arming released one virtual, and if the
+     * key that then dipped was the OTHER one, `act` named a key whose virtual
+     * was already up - so the handover wrote up(already-up) + down(already-
+     * down) and the kernel ate both. Deferring the binding to the first dip
+     * answered "which finger is leaving", but it made `act` lie about which
+     * virtual was down, which is what cost the note.
+     *
+     * Now arming leaves the picture in the toggle's canonical form - exactly
+     * one virtual down, and `act` names it truthfully - and every later edge
+     * is a plain backplate crossing. up(act) is always a real release and
+     * down(!act) always a real press, whichever finger moves. So the choice
+     * at arming is genuinely arbitrary, `act_bound` is gone, and so is the
+     * cycle that used to repair the no-op. */
     int held[2] = { ad->socd.k1, ad->socd.k2 };
     int before[2];
     socd_virtual_state(held, ad->socd.act, mode, before);
 
-    /* The first key to dip out of the latch owns the output, so that its
-     * release is the one the toggle reverts. Deferring this is the point:
-     * at the moment the latch arms both keys are on the floor and nothing
-     * yet says which finger is leaving, so any choice made there is a
-     * guess - and guessing wrong presses the virtual key of the finger that
-     * is on its way up. The first edge after arming is necessarily a
-     * release (both keys are live, and a live key can only release), which
-     * is exactly the event that answers the question. */
-    if (ad->deep && !ad->act_bound && value == 0) {
-        ad->socd.act  = is_k1;
-        ad->act_bound = 1;
-    }
     if (value == 1)
         ad->last_press = is_k1 ? 0 : 1;
 
@@ -2379,16 +2396,11 @@ static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
     held[1] = ad->socd.k2;
     socd_virtual_state(held, ad->socd.act, mode, after);
 
-    /* Suppress the click when the "press" was a no-change event the input
-     * core drops - a beat you hear but the game never sees.
-     *
-     * This is the common case, not a corner. Ride k1, plant k2 (so the latch
-     * keeps v2 and releases v1), then lift k1: S_RELEASE writes up(v1) over
-     * an already-up key and down(v2) over an already-down key, both dropped
-     * by the kernel, yet socd_apply still reports VOICE_V2. The silence is
-     * correct - the note for that key landed under SOCD_OFF when it bottomed,
-     * and a second one is a doubled beat for one lift. Every real transition
-     * still changes the picture and still clicks. */
+    /* Claim a click only when the virtual picture actually moved. Under the
+     * backplate rule every toggle transition does, so this no longer has a
+     * repair to make - it stays as the guard that keeps the click and the
+     * emitted output in step, and regimetest asserts it never fires while
+     * riding. */
     if (voice != VOICE_NONE &&
         !(before[voice - 1] == 0 && after[voice - 1] == 1))
         voice = VOICE_NONE;
