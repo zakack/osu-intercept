@@ -31,7 +31,9 @@ cmake --build build
 ```
 
 Produces `build/doubletapd`. Requires pkg-config-visible dev packages for
-`libpipewire-0.3`, `libevdev`, and `yaml-0.1` (libyaml).
+`libpipewire-0.3`, `libevdev`, `yaml-0.1` (libyaml), and `samplerate`
+(libsamplerate — the mixer conforms every sample to one rate at load time;
+PipeWire's own resampler is not linkable from here).
 
 There is no test suite, linter, or CI config in this repo — validate changes
 by building and manually exercising the daemon (see Running below).
@@ -94,15 +96,29 @@ catch a fault in the read/decode path. Cases M-Q cover the slot layer: M is
 the two-key regression gate, N/O the pool's alternation and its third-key
 sharing, P the arming eviction, R the latch-pair canonicalisation, Q
 autorepeat and the `off`-mode alternation.
-Both tools drive the analog front-end with a two-key pool and bring their
+`replay` and `regimetest` drive the analog front-end with a two-key pool
+and bring their
 `analog_dev_t` up through `analog_dev_stub`, which seeds the slot table —
 a memset would not. `tests/*.csv` are recorded `-T`
 sessions named `<style>_<name>_Nphys_Mvirt.csv`, where N is the physical
 presses played and M the virtual presses the daemon must emit — `replay`
 prints M, so the filename is the expected result. The `tap_*` traces must
 report ZERO latches; the `toggle_*` traces must latch and must emit MORE
-virtual presses than physical. Both
-tools build as part of `all`, deliberately: they `#include doubletapd.c`, and
+virtual presses than physical.
+
+`tools/mixtest.c` is the third of these — assertions over the audio voice
+pool, the SPSC trigger ring and the summed output buffer, run with
+`./build/mixtest`. It needs no PipeWire and no stubs: `audio_mix` is the
+whole mixer as a pure function over a float buffer, which is exactly why it
+was factored out of `on_process`. Triggers go in through the real
+`audio_trigger`, since the ring is the thread boundary and that is where the
+bug worth catching lives. Cases C (overlap sums), E (retirement exactly on a
+buffer boundary), G (oldest-steal) and H/I (ring full, ring wrap) are the
+ones that pin the design; L/M cover `sample_conform`. It cannot see a
+memory-ordering bug — it is single-threaded by construction — so a
+`-fsanitize=thread` run of the daemon is still the check for that.
+
+All three tools build as part of `all`, deliberately: they `#include doubletapd.c`, and
 that guarantee is worthless if the binaries can go stale.
 
 `tools/e2e.py` is the outside-in counterpart: it runs the real binary against
@@ -242,14 +258,29 @@ sections (search for the `/* --- */` banner comments):
    keeps running with zero devices, waiting for hotplug (it only aborts at
    startup if nothing opened AND inotify is unavailable).
 
-8. **Audio** (`wav_load`, `audio_init`, `on_process`, `audio_trigger`) — a
-   hand-rolled WAV reader (16/24/32-bit PCM) loads the click sample into a
-   float buffer up front. Playback runs on a dedicated PipeWire thread loop
-   (`pw_thread_loop`); `on_process` is the realtime audio callback and only
-   touches shared state through `atomic_*` operations (`playing`, `pending`,
-   `reset`, `frame_pos`) since it runs on PipeWire's RT thread while
-   `audio_trigger` is called from the main epoll thread. Overlapping
-   triggers restart playback from frame 0 rather than queuing.
+8. **Audio** (`wav_load`, `sample_conform`, `audio_mix`, `audio_trigger`) —
+   a standard sampler: ONE PipeWire stream, an internal polyphonic mixer,
+   and a fixed pool of voices. The two numbers this separates used to be the
+   same one: how many distinct samples are MAPPED (`AUDIO_NSAMPLES`, two
+   today — V1's click and V2's) and how many sounds can be IN FLIGHT
+   (`AUDIO_MAX_VOICES`, 32). Sixteen mapped keys would still want one output
+   node and a handful of concurrent voices.
+
+   A `mix_voice_t` is a playing INSTANCE — `{samples, nframes, pos, gain,
+   seq, active}`. `audio_mix` drains the trigger ring, walks the active
+   voices summing them into the output buffer, retires the ones that ran
+   out, and clamps. Triggering allocates a voice; it does not touch a
+   stream, so a click never cuts off the one before it — not the other
+   key's, and not an earlier press of the same key. That is the point: the
+   shipped click is 125ms and a 300 BPM stream is one tap every 50ms, so the
+   old per-stream restart truncated every note of a burst at 40%.
+
+   `wav_load` is a hand-rolled 16/24/32-bit PCM reader and nothing more;
+   `sample_conform` then brings each sample to `MIX_RATE`/`MIX_CHANNELS`
+   (48kHz stereo) via libsamplerate, once, at startup. Mixing is what forces
+   that — with a stream per sample PipeWire negotiated a format per stream
+   and converted for us; one shared buffer means everything has to agree
+   before it gets there.
 
 `main()` wires these together: parse args -> load config -> attempt
 `SCHED_FIFO` realtime priority (best-effort, warns and falls back on
@@ -477,6 +508,61 @@ down in reverse order.
   requires having planted both first, it clears the moment the resting
   finger leaves the floor, and during a real burst every stroke bottoms out
   by definition. Untested in play as of this writing.
+
+## Key invariants to preserve when editing the audio mixer
+
+- THE TRIGGER RING IS THE ONLY STATE SHARED BETWEEN THREADS. Not "the main
+  shared state" — the only one. Every other field the mixer touches is
+  private to one side, which is why there is not an atomic anywhere in
+  `mix_voice_t`. The previous design had four atomics PER STREAM
+  (`playing`/`pending`/`reset`/`frame_pos`) and would have grown four more
+  per sample added; this one does not grow at all.
+- THERE IS EXACTLY ONE PRODUCER, and it is the epoll loop. Both callers of
+  `audio_trigger` — `process_event` and `ANALOG_CLICK` in `analog_report` —
+  run there, single-threaded. The ring's `head`/`tail` protocol is SPSC and
+  is wrong the moment a second thread pushes. If audio ever needs triggering
+  from somewhere else, that is a design change, not a call site.
+- ALLOCATION AND STEALING HAPPEN ON THE CONSUMER SIDE, inside
+  `mix_drain_triggers`. It is tempting to have `audio_trigger` pick the
+  voice, since it already knows the sample — but a producer reaching into
+  the pool would need a per-voice atomic flag to claim a slot, which is
+  precisely the per-stream atomics this design removed. The producer's whole
+  job is to write one byte and bump `head`.
+- `audio_mix` DOES NOT ALLOCATE, LOCK, OR MAKE A SYSCALL. It runs on
+  PipeWire's RT thread. Anything that would (loading a sample, resizing the
+  pool, logging) belongs at startup.
+- SAMPLES ARE CONFORMED AT LOAD, NEVER IN RT. `sample_conform` is the reason
+  mixing is possible at all: one shared output buffer means every sample
+  must already be at `MIX_RATE`/`MIX_CHANNELS` before the callback sees it.
+  `MIX_RATE` is a compile-time constant and must stay one — deriving it from
+  the loaded samples would make the graph's rate depend on which WAV
+  happened to open successfully, and the loader has to know its target
+  before it resamples.
+- `wav_load` STAYS A PURE DECODER. It returns an interleaved float buffer
+  and reports the file's own rate and channel count; it does not know
+  `MIX_RATE` exists. Folding the conversion back into it would make the
+  conform path untestable without a file on disk, which is what `mixtest`
+  cases L and M rely on.
+- A FULL RING DROPS AND COUNTS. `audio_trigger` never blocks and never
+  spins: it is called from the input path, and a stalled epoll loop costs a
+  keypress, which matters infinitely more than a click. 64 entries against a
+  ~10ms graph quantum is not reachable by human hands; the counter exists to
+  prove that rather than to be acted on.
+- VOICE STEALING TAKES THE OLDEST, by signed `seq` difference so a wrapped
+  counter still orders correctly. Three lines, and unreachable in practice
+  with 32 voices — but a pool that silently dropped the NEWEST trigger would
+  swallow the note you just played, which is the one that matters.
+- `AUDIO_NSAMPLES` AND `AUDIO_MAX_VOICES` ARE DIFFERENT NUMBERS and must
+  stay that way. They were the same number in the old per-stream design and
+  that is exactly what made overlapping clicks impossible. Adding per-key
+  samples means growing the first alone.
+- THE OUTPUT IS SUMMED IN FLOAT AND CLAMPED. No limiter, no per-voice
+  ducking: with realistic overlap the clamp never engages, and a click is
+  not worth a compressor. If a test's expected value comes back exactly
+  1.0, suspect the fixture's amplitudes before suspecting the mixer.
+- A TRIGGER LANDS AT THE START OF THE NEXT BUFFER. Sub-buffer placement
+  would need a timestamp in the ring entry and an offset in the voice; it is
+  a deliberate non-goal, and identical to what the old design did.
 
 ## Key invariants to preserve when editing `process_event`
 
