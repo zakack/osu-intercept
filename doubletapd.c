@@ -476,21 +476,23 @@ typedef struct {
                            * subtraction that suits one end goes negative at
                            * the other. */
     /* bottom_out_mm defines the backplate, and the backplate is the whole
-     * gesture: both keys on it at once is what arms `deep` and hands k1/k2
-     * to the toggle. It does double duty as the rapid-trigger bottom-out
-     * line, deliberately - one number, so there is one place to tune how
-     * far down "planted" means. */
+     * gesture: both LATCH keys on it at once is what arms `deep` and hands
+     * the pool to the toggle. It does triple duty, deliberately - one
+     * number, so there is one place to tune how far down "planted" means:
+     * the tapping bottom-out re-press, the latch threshold, and the only
+     * threshold in force while riding. */
     int    rt_enabled;
+    /* Rapid trigger is TAPPING-ONLY. While the latch is armed the backplate
+     * is the switch and neither reversal distance runs at all - riding
+     * bottoms out every stroke by definition, so every note in a burst
+     * lands on the same hard physical line. (An earlier revision ran a
+     * second `deep_press_mm`/`deep_release_mm` profile here; those config
+     * keys were removed, and load_config warns if it still finds them.) */
     float  rt_press_mm;   /* downward reversal that re-presses */
     float  rt_release_mm; /* upward reversal that releases */
-    /* Rapid trigger runs two profiles, picked by whether the `deep` latch
-     * is armed: riding uses the deep pair, tapping the plain one. A
-     * negative value means "unset"; analog_config_resolve fills it from
-     * the tapping value, so an unconfigured daemon runs one profile.
-     * 0 means the edge is disabled while riding. */
     float  bottom_out_mm; /* within this of full travel == bottomed out:
                            * presses regardless of rt_press_mm, and, for
-                           * both keys at once, arms `deep` */
+                           * both latch keys at once, arms `deep` */
     /* HID usage overrides, parallel to keys.pool; -1 == derive from the
      * keymap. 'analog.hid_k1'/'hid_k2' are the legacy two-key spelling and
      * write entries 0 and 1. */

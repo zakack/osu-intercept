@@ -73,11 +73,11 @@ no uinput device) for picking thresholds and discovering HID usage ids.
 PAIR's travel per report, for replaying a session offline. It stays two
 keys wide whatever the pool's size — the header is `us,k1_mm,k2_mm` and
 every recorded trace under `tests/` is in that format, so widening it would
-invalidate the corpus to record keys that cannot arm the latch anyway. `tools/replay.c`
-consumes it — built on demand with `cmake --build build --target replay`,
-excluded from `all`, and NOT installed. It `#include`s `doubletapd.c` and
-stubs only the uinput writes, so it exercises the daemon's real state
-machine rather than a copy that could drift; keep it that way.
+invalidate the corpus to record keys that cannot arm the latch anyway.
+`tools/replay.c` consumes it — built as part of `all` (see below), and NOT
+installed. It `#include`s `doubletapd.c` and stubs only the uinput writes, so
+it exercises the daemon's real state machine rather than a copy that could
+drift; keep it that way.
 `analog_report` is the per-report path — feed, resolve the latch, re-anchor,
 route the edges — split out of `analog_drain` so BOTH tools call the real
 thing. They used to restate that ordering inline, which is precisely the
