@@ -34,6 +34,10 @@
 #            suppressed key does nothing.
 #   off    - no SOCD cleaning: k1/k2 are simply remapped to v1/v2
 #            (audio click still plays on each press).
+#   analog - toggle, but driven by how far the keys are actually pressed
+#            rather than by a single fixed actuation point. Requires an
+#            analog keyboard; see the `analog` section below. Falls back to
+#            `toggle` (with a warning) if no analog device is found.
 socd: toggle
 
 # Key mapping. Codes can be symbolic ("KEY_Z") or numeric (44).
@@ -65,6 +69,82 @@ audio:
   # wav_v2: /usr/share/doubletap/clack.wav
   # gain_v1: 1.0
   # gain_v2: 0.8
+
+# Analog mode (socd: analog). OPTIONAL - ignored by every other mode.
+#
+# Analog keyboards report how far each key is pressed, not just whether it
+# is down. That lets one session serve BOTH play patterns instead of making
+# you pick one here:
+#
+#   alt-tapping  - alternating discrete taps between k1 and k2. Wants `off`:
+#                  at speed the taps overlap, and a toggle reads that
+#                  overlap as a rock and re-presses a key you never struck.
+#   rocking      - both fingers planted, rocking between the keys. Wants
+#                  `toggle`, for gap-free alternation.
+#
+# The switch between them is the `deep` latch:
+#
+#   ARMS   when BOTH keys are on the backplate in one report -> toggle
+#   DISARMS when BOTH keys are off the backplate             -> off
+#
+# Planting both keys is the rock and nothing else is: alt-tapping's defining
+# shape is one finger leaving as the other arrives, so the two are never on
+# the floor together however fast you play. Until it arms, the two keys stay
+# fully independent and an incidental overlap costs nothing.
+#
+# Because the backplate is a hard physical stop, this is a trigger you can
+# aim - "plant both keys to start rocking" is something you can actually do,
+# unlike "cross some depth in the middle of travel". Where the backplate
+# starts is rapid_trigger.bottom_out_mm, the single most important number
+# here: it defines the latch AND the rapid-trigger bottom-out line.
+#
+# Arming is silent - it emits no press and no click, since the notes for
+# both keys already landed when they bottomed. One key held deep while the
+# other is tapped is NOT treated as anything special; the two keys' depths
+# are never compared against each other.
+#
+# While the latch is armed the backplate IS the switch: a key counts as down
+# while it is against the floor and up as soon as it leaves, and rapid trigger
+# does not run at all. That is what riding already is - you bottom out every
+# stroke - so every note in a burst lands on the same hard physical line
+# instead of at whatever depth a reversal distance happened to fall.
+#
+# It also means ONE finger lifting clear does not end the latch. In a burst a
+# finger routinely comes right off the switch while the other stays planted;
+# ending the latch there would send the next note through the tapping profile
+# at actuation_mm, landing it early. Only both fingers leaving the floor ends
+# it, and that release is silent.
+#
+# Rapid trigger (press_mm/release_mm) therefore applies to TAPPING only.
+#
+# Run `doubletapd -A` to watch live travel depth and pick numbers against
+# your own hands, or `doubletapd -T > s.csv` to record a session and replay
+# it offline (see the replay tool). Recording your own alt-tapping and
+# checking that `replay` reports ZERO latches is the test that matters.
+#
+# Turn OFF the keyboard's own rapid trigger and SOCD (Snappy Tappy / Rappy
+# Snappy) in its configuration tool - the daemon does both itself here, and
+# on-board versions will fight it.
+#
+# analog:
+#   device: auto          # or an explicit /dev/hidrawN
+#   travel_mm: 4.0        # full key travel (Wooting 60HE+ is 4.0)
+#   actuation_mm: 1.0     # press threshold while TAPPING. Not used while
+#                         # riding, where the backplate is the switch.
+#   rapid_trigger:
+#     enabled: true
+#     press_mm: 0.3       # downward reversal that re-presses  } tapping
+#     release_mm: 0.3     # upward reversal that releases      } only
+#     bottom_out_mm: 0.2  # where the backplate starts, measured from full
+#                         # travel: 0.2 on a 4.0mm switch = 95%. Bottoming
+#                         # out always presses however small the
+#                         # down-travel, it is what arms the deep latch when
+#                         # both keys reach it, and while the latch is armed
+#                         # it is the ONLY threshold. Must be > 0; keep
+#                         # it under ~10% of travel, or a firm tap can
+#                         # reach it and alt-tapping may arm the latch.
+#   hid_k1: auto          # HID usage ids; derived from the keyboard's own
+#   hid_k2: auto          # keymap unless pinned here (see -A)
 
 # Identification of the virtual uinput keyboard.
 uinput:

@@ -6,11 +6,18 @@
  * every keyboard-shaped device that advertises both configured keys
  * (with inotify-driven hotplug either way) - applies a SOCD state
  * machine ("toggle"/"on" = last-input + reverting toggle, "snappy" =
- * last input wins, or "off" = plain remap with no cleaning, per the
- * config's socd field) to two configurable physical
+ * last input wins, "analog" = toggle and off switched at runtime by how
+ * far the keys are pressed, or "off" = plain remap with no cleaning, per
+ * the config's socd field) to two configurable physical
  * keys (k1, k2 -> v1, v2), mirrors every other event verbatim into a
  * single uinput virtual keyboard, and plays a click sound through
  * PipeWire on every virtual key-press.
+ *
+ * In analog mode the keyboard's travel depth is read straight off its
+ * vendor HID interface and the `deep` latch decides which machine is in
+ * force: it arms when BOTH keys are on the backplate in one report (that
+ * is a rock) and disarms when either comes back up past actuation (that
+ * is tapping). See analog_deep_update.
  *
  * Copyright 2026 Zachary Kessler
  */
@@ -21,6 +28,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <sched.h>
 #include <stdarg.h>
@@ -28,6 +36,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -35,6 +44,7 @@
 
 #include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -74,8 +84,18 @@
 static void logf_(const char *level, const char *fmt, ...)
 __attribute__((format(printf, 2, 3)));
 
+/* Set by the offline tools (replay, regimetest) while they push samples
+ * through the state machine. They run the same code the daemon does, so the
+ * daemon's own progress chatter comes out of them too - and replay's
+ * bottom_out sweep runs the whole trace nine times over, which turns one
+ * latch log per rock into thousands of lines across a real recording.
+ * Warnings and errors are never suppressed; only the running commentary. */
+static int g_log_quiet;
+
 static void logf_(const char *level, const char *fmt, ...) {
     va_list ap;
+    if (g_log_quiet && strcmp(level, "info") == 0)
+        return;
     fprintf(stderr, "[doubletapd] %s: ", level);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -87,6 +107,17 @@ static void logf_(const char *level, const char *fmt, ...) {
 #define LOG_INFO(...) logf_("info",  __VA_ARGS__)
 #define LOG_WARN(...) logf_("warn",  __VA_ARGS__)
 #define LOG_ERR(...)  logf_("error", __VA_ARGS__)
+
+/* ------------------------------------------------------------------------- */
+/* Signals                                                                   */
+/* ------------------------------------------------------------------------- */
+
+static volatile sig_atomic_t g_running = 1;
+
+static void on_signal(int sig) {
+    (void)sig;
+    g_running = 0;
+}
 
 /* ------------------------------------------------------------------------- */
 /* Audio (PipeWire)                                                          */
@@ -420,7 +451,44 @@ enum {
     SOCD_TOGGLE = 0, /* last-input + reverting toggle (latching) */
     SOCD_SNAPPY = 1, /* last input wins; only the active key's release reverts */
     SOCD_OFF    = 2, /* no cleaning; k1/k2 -> v1/v2 remap only */
+    SOCD_ANALOG = 3, /* toggle, but driven by travel depth (see analog_key_t) */
 };
+
+/* Analog mode tuning. Depths are millimetres of travel; see the banner in
+ * the analog section for what each threshold gates. */
+typedef struct {
+    char  *device;        /* explicit /dev/hidrawN, NULL == auto-discover */
+    float  travel_mm;     /* full key travel, for normalized -> mm */
+    float  actuation_mm;  /* press threshold */
+    float  release_mm;    /* DERIVED, not configured: actuation_mm scaled by
+                           * ANALOG_RELEASE_RATIO. Hysteresis is not a taste
+                           * - it only has to be far enough below actuation
+                           * that a resting finger cannot straddle both, and
+                           * far enough above the firmware's reporting floor
+                           * that a key at rest still counts as released.
+                           * Scaling beats a fixed offset because actuation
+                           * ranges from 0.1mm to most of the travel, and a
+                           * subtraction that suits one end goes negative at
+                           * the other. */
+    /* bottom_out_mm defines the backplate, and the backplate is the whole
+     * gesture: both keys on it at once is what arms `deep` and hands k1/k2
+     * to the toggle. It does double duty as the rapid-trigger bottom-out
+     * line, deliberately - one number, so there is one place to tune how
+     * far down "planted" means. */
+    int    rt_enabled;
+    float  rt_press_mm;   /* downward reversal that re-presses */
+    float  rt_release_mm; /* upward reversal that releases */
+    /* Rapid trigger runs two profiles, picked by whether the `deep` latch
+     * is armed: riding uses the deep pair, tapping the plain one. A
+     * negative value means "unset"; analog_config_resolve fills it from
+     * the tapping value, so an unconfigured daemon runs one profile.
+     * 0 means the edge is disabled while riding. */
+    float  bottom_out_mm; /* within this of full travel == bottomed out:
+                           * presses regardless of rt_press_mm, and, for
+                           * both keys at once, arms `deep` */
+    int    hid_k1;        /* HID usage override; -1 == derive from the keymap */
+    int    hid_k2;
+} analog_config_t;
 
 typedef struct {
     char   **device_paths;
@@ -436,6 +504,7 @@ typedef struct {
     float    gain_v1;       /* V1 gain override (<0 -> use gain) */
     float    gain_v2;       /* V2 gain override (<0 -> use gain) */
     char    *uinput_name;
+    analog_config_t analog;
 } oid_config_t;
 
 static void config_init(oid_config_t *c) {
@@ -448,6 +517,14 @@ static void config_init(oid_config_t *c) {
     c->gain    = 1.0f;
     c->gain_v1 = -1.0f; /* sentinel: unset -> falls back to gain */
     c->gain_v2 = -1.0f;
+    c->analog.travel_mm     = 4.0f;
+    c->analog.actuation_mm  = 1.0f;
+    c->analog.rt_enabled    = 1;
+    c->analog.rt_press_mm   = 0.3f;
+    c->analog.rt_release_mm = 0.3f;
+    c->analog.bottom_out_mm = 0.20f;  /* 95% of the 4mm default travel */
+    c->analog.hid_k1        = -1;   /* sentinel: derive from the keymap */
+    c->analog.hid_k2        = -1;
 }
 
 static void config_free(oid_config_t *c) {
@@ -459,6 +536,7 @@ static void config_free(oid_config_t *c) {
     free(c->wav_v1);
     free(c->wav_v2);
     free(c->uinput_name);
+    free(c->analog.device);
     memset(c, 0, sizeof(*c));
 }
 
@@ -510,6 +588,111 @@ static int parse_gain(yaml_node_t *n, float *out) {
     if (end == s || *end != '\0' || errno != 0 || d < 0.0)
         return -1;
     *out = (float)d;
+    return 0;
+}
+
+
+/* Fill in the deep profile from the tapping profile wherever the config
+ * left it unset, so everything downstream reads concrete numbers. */
+/* Hysteresis as a fraction of actuation, and the shallowest derived
+ * release worth trusting: a Wooting's firmware stops reporting a key a few
+ * hundredths of a millimetre from rest, and a release threshold underneath
+ * that would never fire. */
+#define ANALOG_RELEASE_RATIO 0.8f
+#define ANALOG_RELEASE_FLOOR 0.04f
+
+static void analog_config_resolve(analog_config_t *a) {
+    a->release_mm = a->actuation_mm * ANALOG_RELEASE_RATIO;
+}
+
+/* Thresholds that are individually well-formed can still combine into a
+ * broken machine, and the failure modes are hard to attribute while playing:
+ * a key that self-oscillates at the report rate, or one whose deep latch can
+ * never clear. Reject those outright rather than let them reach the RT path.
+ * Only enforced for socd: analog - an unused analog block stays harmless. */
+static int analog_config_check(const analog_config_t *a) {
+    int bad = 0;
+
+    if (a->travel_mm <= 0.0f) {
+        LOG_ERR("'analog.travel_mm' must be greater than 0");
+        bad = 1;
+    }
+    if (a->actuation_mm <= 0.0f) {
+        LOG_ERR("'analog.actuation_mm' must be greater than 0");
+        bad = 1;
+    }
+    if (a->rt_enabled && a->rt_press_mm <= 0.0f) {
+        LOG_ERR("'analog.rapid_trigger.press_mm' must be greater than 0");
+        bad = 1;
+    }
+    if (a->rt_enabled && a->rt_release_mm <= 0.0f) {
+        LOG_ERR("'analog.rapid_trigger.release_mm' must be greater than 0, "
+                "otherwise a held key releases itself");
+        bad = 1;
+    }
+    /* Nothing could ever re-press a key in the riding zone: travel is
+     * switched off and there is no backplate rule to fall back on. */
+    /* The backplate is load-bearing now: it defines the gesture, not just
+     * a rapid-trigger corner case. */
+    if (a->bottom_out_mm <= 0.0f) {
+        LOG_ERR("'analog.rapid_trigger.bottom_out_mm' must be greater than "
+                "0: it defines where the backplate starts, and both keys "
+                "reaching it is what arms the deep latch");
+        bad = 1;
+    }
+    /* Actuation has to sit above the backplate, and the deep latch makes
+     * this load-bearing rather than merely tidy: actuation_mm is what
+     * DISARMS the latch, so an actuation line at or below the backplate
+     * would disarm it on the very sample it armed, and with actuation past
+     * travel_mm the key could never actuate at all. Both are silent
+     * bricks. */
+    if (a->travel_mm > 0.0f && a->bottom_out_mm > 0.0f &&
+        a->actuation_mm >= a->travel_mm - a->bottom_out_mm) {
+        LOG_ERR("'analog.actuation_mm' (%.3f) must be shallower than the "
+                "backplate at %.3fmm (travel_mm - bottom_out_mm), otherwise "
+                "a key can reach the floor without ever actuating",
+                (double)a->actuation_mm,
+                (double)(a->travel_mm - a->bottom_out_mm));
+        bad = 1;
+    }
+    if (a->bottom_out_mm >= a->travel_mm) {
+        LOG_ERR("'analog.rapid_trigger.bottom_out_mm' (%.3f) must be less "
+                "than travel_mm (%.3f): every sample would count as "
+                "bottomed",
+                (double)a->bottom_out_mm, (double)a->travel_mm);
+        bad = 1;
+    }
+    if (a->hid_k1 >= 0 && a->hid_k1 == a->hid_k2) {
+        LOG_ERR("'analog.hid_k1' and 'analog.hid_k2' are both 0x%02x: one "
+                "physical key would drive both virtual keys",
+                a->hid_k1);
+        bad = 1;
+    }
+    if (bad)
+        return -1;
+
+    /* Survivable, but almost certainly not what was meant. */
+    if (a->release_mm < ANALOG_RELEASE_FLOOR)
+        LOG_WARN("'analog.actuation_mm' (%.3f) puts the derived release at "
+                 "%.3fmm, under the ~%.2fmm the firmware stops reporting at: "
+                 "a resting key may never count as released",
+                 (double)a->actuation_mm, (double)a->release_mm,
+                 (double)ANALOG_RELEASE_FLOOR);
+    if (a->bottom_out_mm >= a->travel_mm)
+        LOG_WARN("'analog.rapid_trigger.bottom_out_mm' (%.3f) >= travel_mm "
+                 "(%.3f): every sample counts as bottomed out",
+                 (double)a->bottom_out_mm, (double)a->travel_mm);
+    /* A backplate under 90% of travel is reachable by a firm tap, and a tap
+     * that reaches it is a tap that can arm the latch - which is exactly the
+     * alt-tapping misfire the latch exists to avoid. */
+    if (a->travel_mm > 0.0f && a->bottom_out_mm > 0.10f * a->travel_mm)
+        LOG_WARN("'analog.rapid_trigger.bottom_out_mm' (%.3f) puts the "
+                 "backplate at %.1f%% of travel: below ~90%% a firm tap can "
+                 "reach it, and two overlapping taps could arm the deep "
+                 "latch. Record a session with -T and check it with `replay`",
+                 (double)a->bottom_out_mm,
+                 (double)((a->travel_mm - a->bottom_out_mm)
+                          / a->travel_mm * 100.0f));
     return 0;
 }
 
@@ -641,9 +824,111 @@ static int load_config(const char *path, oid_config_t *c) {
             c->socd = SOCD_SNAPPY;
         else if (!strcasecmp(s, "off"))
             c->socd = SOCD_OFF;
+        else if (!strcasecmp(s, "analog"))
+            c->socd = SOCD_ANALOG;
         else {
-            LOG_ERR("'socd' must be \"toggle\"/\"on\", \"snappy\", or \"off\"");
+            LOG_ERR("'socd' must be \"toggle\"/\"on\", \"snappy\", "
+                    "\"analog\", or \"off\"");
             goto out;
+        }
+    }
+
+    /* analog: optional mapping */
+    yaml_node_t *an = map_get(&doc, root, "analog");
+    if (an) {
+        if (an->type != YAML_MAPPING_NODE) {
+            LOG_ERR("'analog' must be a mapping");
+            goto out;
+        }
+        yaml_node_t *dv = map_get(&doc, an, "device");
+        if (dv) {
+            const char *s = dv->type == YAML_SCALAR_NODE
+                            ? (const char *)dv->data.scalar.value : "";
+            if (strcasecmp(s, "auto") != 0 &&
+                scalar_dup(dv, &c->analog.device) != 0) {
+                LOG_ERR("'analog.device' must be a scalar string");
+                goto out;
+            }
+        }
+        static const struct { const char *key; size_t off; } mm[] = {
+            { "travel_mm",     offsetof(analog_config_t, travel_mm)     },
+            { "actuation_mm",  offsetof(analog_config_t, actuation_mm)  },
+        };
+        for (size_t i = 0; i < sizeof(mm) / sizeof(mm[0]); i++) {
+            yaml_node_t *v = map_get(&doc, an, mm[i].key);
+            if (v && parse_gain(v, (float *)((char *)&c->analog + mm[i].off))) {
+                LOG_ERR("'analog.%s' must be a non-negative number", mm[i].key);
+                goto out;
+            }
+        }
+        /* Removed along with the gate. Warn rather than fail: a stale key
+         * in a config file should not stop the daemon starting. */
+        if (map_get(&doc, an, "gate") || map_get(&doc, an, "gate_depth_mm") ||
+            map_get(&doc, an, "gate_margin_mm") ||
+            map_get(&doc, an, "socd_depth_mm") ||
+            map_get(&doc, an, "engage") ||
+            map_get(&doc, an, "release_mm"))
+            LOG_WARN("'analog.gate', 'gate_depth_mm', 'gate_margin_mm', "
+                     "'socd_depth_mm', 'engage' and 'release_mm' were "
+                     "removed and are ignored - both keys reaching the "
+                     "backplate is what arms the deep latch, and release "
+                     "follows actuation");
+
+        yaml_node_t *rt = map_get(&doc, an, "rapid_trigger");
+        if (rt) {
+            if (rt->type != YAML_MAPPING_NODE) {
+                LOG_ERR("'analog.rapid_trigger' must be a mapping");
+                goto out;
+            }
+            yaml_node_t *en = map_get(&doc, rt, "enabled");
+            if (en && parse_bool(en, &c->analog.rt_enabled) != 0) {
+                LOG_ERR("'analog.rapid_trigger.enabled' must be a boolean");
+                goto out;
+            }
+            yaml_node_t *pm = map_get(&doc, rt, "press_mm");
+            if (pm && parse_gain(pm, &c->analog.rt_press_mm) != 0) {
+                LOG_ERR("'analog.rapid_trigger.press_mm' must be a "
+                        "non-negative number");
+                goto out;
+            }
+            yaml_node_t *bo = map_get(&doc, rt, "bottom_out_mm");
+            if (bo && parse_gain(bo, &c->analog.bottom_out_mm) != 0) {
+                LOG_ERR("'analog.rapid_trigger.bottom_out_mm' must be a "
+                        "non-negative number");
+                goto out;
+            }
+            yaml_node_t *rm = map_get(&doc, rt, "release_mm");
+            if (rm && parse_gain(rm, &c->analog.rt_release_mm) != 0) {
+                LOG_ERR("'analog.rapid_trigger.release_mm' must be a "
+                        "non-negative number");
+                goto out;
+            }
+            if (map_get(&doc, rt, "deep_press_mm") ||
+                map_get(&doc, rt, "deep_release_mm"))
+                LOG_WARN("'analog.rapid_trigger.deep_press_mm' and "
+                         "'deep_release_mm' were removed and are ignored - "
+                         "while riding, the backplate itself is the switch "
+                         "and no rapid trigger runs");
+        }
+        static const struct { const char *key; size_t off; } hid[] = {
+            { "hid_k1", offsetof(analog_config_t, hid_k1) },
+            { "hid_k2", offsetof(analog_config_t, hid_k2) },
+        };
+        for (size_t i = 0; i < sizeof(hid) / sizeof(hid[0]); i++) {
+            yaml_node_t *v = map_get(&doc, an, hid[i].key);
+            if (!v) continue;
+            const char *s = v->type == YAML_SCALAR_NODE
+                            ? (const char *)v->data.scalar.value : "";
+            if (!strcasecmp(s, "auto")) continue;
+            char *end = NULL;
+            errno = 0;
+            long u = strtol(s, &end, 0);
+            if (end == s || *end != '\0' || errno != 0 || u < 0 || u > 0xFFFF) {
+                LOG_ERR("'analog.%s' must be \"auto\" or a HID usage id",
+                        hid[i].key);
+                goto out;
+            }
+            *(int *)((char *)&c->analog + hid[i].off) = (int)u;
         }
     }
 
@@ -715,6 +1000,10 @@ static int load_config(const char *path, oid_config_t *c) {
         if (!c->uinput_name) { LOG_ERR("oom"); goto out; }
     }
 
+    analog_config_resolve(&c->analog);
+    if (c->socd == SOCD_ANALOG && analog_config_check(&c->analog) != 0)
+        goto out;
+
     rc = 0;
 
 out:
@@ -729,16 +1018,31 @@ out:
 /* Input devices                                                             */
 /* ------------------------------------------------------------------------- */
 
+/* epoll user-data tag. The inotify fd is still identified by a NULL ptr;
+ * everything else leads with one of these so run_loop can tell an evdev
+ * device from the analog hidraw node. */
+enum { EP_INPUT = 1, EP_ANALOG = 2 };
+
+/* SOCD state for one input source. Per-source, not global: several
+ * keyboards are tracked independently even though they share one virtual
+ * output device, and the analog path carries its own instance too. */
 typedef struct {
+    int k1;   /* k1 down? */
+    int k2;   /* k2 down? */
+    int act;  /* 1 == v1 active, 0 == v2 (or none) */
+    int mode; /* mode of the last edge applied; release_stuck needs the
+               * EFFECTIVE mode, which for the analog path is not cfg->socd */
+} socd_state_t;
+
+typedef struct {
+    int               kind;    /* EP_INPUT */
     struct libevdev  *dev;
     int               fd;
     char             *path;
     dev_t             rdev; /* st_rdev, dedupes nodes reached via symlinks */
     int               grabbed; /* 0 = open but grab deferred (keys held) */
-    int               k1;   /* k1 down? */
-    int               k2;   /* k2  down? */
-    int               act;  /* 1 == v1 active, 0 == v2 (or none) */
-    int               last_was_k1;
+    int               analog;  /* k1/k2 come from the analog path; drop them */
+    socd_state_t      socd;
 } input_dev_t;
 
 /* Grabbed devices as stable heap pointers: epoll user data points at the
@@ -774,6 +1078,11 @@ static int dev_list_has_rdev(const dev_list_t *l, dev_t rdev) {
         if (l->v[i]->rdev == rdev) return 1;
     return 0;
 }
+
+/* Vendor/product of the keyboard whose k1/k2 the analog path owns, or 0
+ * when nothing does. Devices matching it get in->analog set, which makes
+ * process_event drop their digital k1/k2 so each press is emitted once. */
+static uint16_t g_analog_vid, g_analog_pid;
 
 /* Never grab a doubletap output device: grabbing our own uinput node (or
  * another instance's) feeds every emitted event straight back in as input -
@@ -879,6 +1188,10 @@ static input_dev_t *input_try_open(const char *path, const oid_config_t *cfg,
         close(fd);
         return NULL;
     }
+    in->kind    = EP_INPUT;
+    in->analog  = g_analog_vid &&
+                  libevdev_get_id_vendor(dev)  == (int)g_analog_vid &&
+                  libevdev_get_id_product(dev) == (int)g_analog_pid;
     in->fd      = fd;
     in->dev     = dev;
     in->path    = strdup(path);
@@ -969,6 +1282,675 @@ static void reconcile_devices(dev_list_t *devs, const oid_config_t *cfg,
 }
 
 /* ------------------------------------------------------------------------- */
+/* Analog input (hidraw)                                                     */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Analog keyboards report per-key travel depth on a vendor-defined HID
+ * interface, separate from the keyboard interface evdev binds to. The
+ * kernel creates no input node for a vendor usage page, so that interface
+ * exists purely as a /dev/hidrawN character device: a pollable fd that
+ * drops straight into the epoll set in run_loop(), and one that EVIOCGRAB
+ * on the keyboard node has no bearing on. We can grab the keyboard and
+ * read its analog stream at the same time.
+ *
+ * Two report formats are in the wild:
+ *
+ *   v2 (usage page 0xFF53) - 64 bytes, sixteen 4-byte slots, 10-bit depth
+ *       [matrix_pos][key][packed][value]
+ *   v1 (usage page 0xFF54) - 48 bytes, sixteen 3-byte slots, 8-bit depth
+ *       [code_hi][code_lo][value]
+ *
+ * Both carry only keys that are off their rest position. A key that has
+ * just been released appears once with a zero value and then vanishes, so
+ * "absent from the report" means "at rest" - see analog_feed().
+ */
+
+#define WOOTING_VID         0x31E3
+#define WOOTING_VID_LEGACY  0x03EB
+
+#define ANALOG_SLOTS        16
+#define ANALOG_V1_REPORT    (ANALOG_SLOTS * 3)  /* 48 */
+#define ANALOG_V2_REPORT    (ANALOG_SLOTS * 4)  /* 64 */
+#define ANALOG_DESC_MAX     4096
+
+enum { ANALOG_FMT_NONE = 0, ANALOG_FMT_V1, ANALOG_FMT_V2 };
+
+/* One decoded key from an analog report. */
+typedef struct {
+    uint16_t code;   /* HID usage id; namespace 0 == ordinary keyboard key */
+    float    depth;  /* 0.0 at rest .. 1.0 bottomed out */
+} analog_sample_t;
+
+/* HID_ID=0003:000031E3:00001320 -> bus, vendor, product. */
+static int analog_read_ids(const char *sysdir, uint16_t *vid, uint16_t *pid) {
+    char path[PATH_MAX], line[256];
+    int  found = -1;
+
+    snprintf(path, sizeof(path), "%s/device/uevent", sysdir);
+    FILE *f = fopen(path, "re");
+    if (!f) return -1;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned bus, v, p;
+        if (sscanf(line, "HID_ID=%x:%x:%x", &bus, &v, &p) == 3) {
+            *vid = (uint16_t)v;
+            *pid = (uint16_t)p;
+            found = 0;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+/* The analog interface is identified by its vendor usage page, which uevent
+ * doesn't expose - so read the report descriptor and look for a Usage Page
+ * item (0x06, two-byte payload) carrying 0xFF53 or 0xFF54. This is a byte
+ * scan rather than a real HID item walk; paired with the vendor check in
+ * analog_scan() that's specific enough, and it keeps this to a few lines. */
+static int analog_probe_fmt(const char *sysdir) {
+    char          path[PATH_MAX];
+    unsigned char buf[ANALOG_DESC_MAX];
+
+    snprintf(path, sizeof(path), "%s/device/report_descriptor", sysdir);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return ANALOG_FMT_NONE;
+    ssize_t n = read(fd, buf, sizeof(buf));
+    close(fd);
+
+    for (ssize_t i = 0; i + 2 < n; i++) {
+        if (buf[i] != 0x06) continue;
+        if (buf[i + 1] == 0x53 && buf[i + 2] == 0xFF) return ANALOG_FMT_V2;
+        if (buf[i + 1] == 0x54 && buf[i + 2] == 0xFF) return ANALOG_FMT_V1;
+    }
+    return ANALOG_FMT_NONE;
+}
+
+/* Decode one raw report into samples; returns the number of live slots.
+ * Slots that are entirely empty are skipped, but a key reporting zero is
+ * kept - that's the one-shot release notification. */
+static int analog_decode(int fmt, const unsigned char *buf, size_t len,
+                         analog_sample_t *out, size_t max) {
+    size_t n = 0;
+
+    if (fmt == ANALOG_FMT_V2) {
+        for (size_t i = 0; i + 4 <= len && n < max; i += 4) {
+            unsigned key    = buf[i + 1];
+            unsigned packed = buf[i + 2];
+            unsigned value  = buf[i + 3];
+            unsigned ns     = (packed >> 2) & 0x0F;
+            unsigned lo     = (packed >> 6) & 0x03;
+            unsigned v10    = (value << 2) | lo;   /* 10-bit, 0..1023 */
+            if (!key && !v10) continue;            /* empty slot */
+            out[n].code  = (uint16_t)((ns << 8) | key);
+            out[n].depth = v10 >= 1023 ? 1.0f : (float)v10 / 1023.0f;
+            n++;
+        }
+    } else if (fmt == ANALOG_FMT_V1) {
+        for (size_t i = 0; i + 3 <= len && n < max; i += 3) {
+            uint16_t code = (uint16_t)((buf[i] << 8) | buf[i + 1]);
+            unsigned v    = buf[i + 2];
+            if (!code) continue;                   /* empty slot */
+            out[n].code  = code;
+            out[n].depth = v >= 255 ? 1.0f : (float)v / 255.0f;
+            n++;
+        }
+    }
+    return (int)n;
+}
+
+/*
+ * Analog front-end for one physical key: turns a stream of travel-depth
+ * samples (mm) into the same press/release edges the digital evdev path
+ * feeds the SOCD core.
+ *
+ * Two thresholds instead of one is the whole feature, but they answer
+ * different questions. actuation_mm means "this is a keypress" and is the
+ * only thing that decides whether an edge is emitted here. The backplate
+ * (travel_mm - bottom_out_mm) means "this key is against the floor", and
+ * this function uses it for one thing only: the bottom-out re-press rule.
+ * Whether the PAIR of keys is on the floor is analog_deep_update's
+ * business, and it reads the two depths directly rather than any latch
+ * kept here - which is why this struct holds no commitment flag.
+ *
+ * `rt_extreme` is continuous across rapid-trigger edges: a rapid-trigger release
+ * does not zero it, so a micro-reversal re-press measures its travel from
+ * the right anchor rather than a stale actuation point. Since every path
+ * that sets `live` also anchors `rt_extreme` to a real sample depth
+ * (always > 0), "engaged but not yet fully released" reads straight off
+ * `rt_extreme != 0.0f` with no extra flag - and rule 1 is the only place
+ * that zeroes it.
+ *
+ * Ordering within one sample, which is what makes a contradictory
+ * press+release pair for one key impossible:
+ *
+ *   1. Full release (depth < release_mm) is a master reset. It overrides
+ *      everything else unconditionally - the key left the switch - emits
+ *      the release if one is owed, and returns.
+ *   2. Otherwise, if the key is still engaged (rt_extreme != 0) and rapid
+ *      trigger is on, ONLY the reversal check runs. A sample that both
+ *      reaches the backplate and constitutes a reversal thus resolves
+ *      unambiguously as the reversal; an engaged key never re-runs the
+ *      fresh-actuation logic.
+ *   3. Otherwise (never actuated this engagement) the fresh-actuation
+ *      check runs instead.
+ *
+ * Every branch that flips `live` is the branch that appends the matching
+ * edge, so `live` cannot desynchronize from what was emitted - socd_apply
+ * downstream assumes strict press/release alternation per key.
+ */
+typedef struct {
+    int   live;        /* an edge has been emitted; key counts as pressed */
+    float rt_extreme;  /* local extreme for rapid trigger, mm */
+} analog_key_t;
+
+typedef struct {
+    analog_key_t key[2];   /* [0] == k1, [1] == k2 */
+} analog_state_t;
+
+/* Feed one sample for one key. idx is 0 (k1) or 1 (k2); a key absent from
+ * the hardware report is fed depth_mm == 0.0f. Writes at most ONE edge to
+ * out[] (1 == press, 0 == release) and returns the count: rule 1 returns
+ * early and rules 2/3 are mutually exclusive, so no path emits two. The
+ * array is kept at two so callers need not change if that ever does. */
+static int analog_key_feed(analog_state_t *st, int idx, float depth_mm,
+                           const analog_config_t *cfg, int riding, int *out) {
+    analog_key_t *self = &st->key[idx];
+    int           n    = 0;
+
+    /* 0. Riding: the backplate IS the switch, and rapid trigger does not run
+     * at all.
+     *
+     * This is the whole simplification. While the latch is armed the player
+     * is bottoming out every stroke by definition - that is what riding is -
+     * so the only threshold that means anything is the floor. Synthesizing
+     * edges from reversal distances here was solving a problem the gesture
+     * does not have, and it made the note land at a different depth
+     * depending on how far the finger happened to travel.
+     *
+     * No hysteresis is needed and none is wanted: the backplate is a
+     * physical stop, so a finger is either against it (reading full travel)
+     * or off it. You cannot hover on a hard surface, which is the same
+     * property that makes the latch itself aimable.
+     *
+     * `rt_extreme` is kept at the current depth purely so the handoff OUT of
+     * riding has a sane anchor - see analog_deep_set, which clears `live` and
+     * leaves this parked, putting the key in the "engaged but not live" state
+     * the tapping profile understands. */
+    if (riding) {
+        int on = depth_mm >= cfg->travel_mm - cfg->bottom_out_mm;
+        self->rt_extreme = depth_mm;
+        if (on != self->live) {
+            self->live = on;
+            out[n++]   = on;
+        }
+        return n;
+    }
+
+    /* 1. Full release: master reset. The only place that zeroes
+     * `rt_extreme`. */
+    if (depth_mm < cfg->release_mm) {
+        if (self->live)
+            out[n++] = 0;
+        self->live       = 0;
+        self->rt_extreme = 0.0f;
+        return n;
+    }
+
+    /* Only the tapping profile reaches here: rule 0 returned for every
+     * riding sample, so there is one set of distances and nothing selects
+     * between them. An earlier design ran a second "deep" profile here and
+     * picked between the two by the latch; the backplate rule above replaces
+     * it outright. */
+    float press   = cfg->rt_press_mm;
+    float release = cfg->rt_release_mm;
+
+    /* Against the backplate: the re-press rule below. The same line is
+     * what analog_deep_update tests for BOTH keys at once, but it reads
+     * the depths itself - nothing about the pair is decided here. */
+    int bottomed = depth_mm >= cfg->travel_mm - cfg->bottom_out_mm;
+
+    if (cfg->rt_enabled && self->rt_extreme != 0.0f) {
+        /* 2. Already engaged: rapid trigger owns this sample exclusively,
+         * tracking the local extreme and firing on a large enough
+         * reversal in either direction. A zero distance disables that
+         * zone's edge outright - the key then holds until rule 1. */
+        if (self->live) {
+            if (depth_mm > self->rt_extreme) {
+                self->rt_extreme = depth_mm;
+            } else if (release > 0.0f &&
+                       self->rt_extreme - depth_mm >= release) {
+                out[n++]         = 0;
+                self->live       = 0;
+                self->rt_extreme = depth_mm;
+            }
+        } else {
+            /* Bottoming out always presses, however small the down-travel
+             * since the last reversal - the mirror of rule 1, where a full
+             * release always releases however small the up-travel. Riding
+             * the backplate as the neutral position depends on this: with a
+             * large press distance, a stroke that ends against the bottom
+             * never travels far enough to satisfy the reversal test on its
+             * own. (While RIDING this no longer applies at all - rule 0
+             * returns before any of this.) */
+            /* A re-press still has to clear actuation_mm: without that
+             * floor, a reversal entirely within the top fraction of travel
+             * synthesizes whole keystrokes where the sensor is least
+             * linear. */
+            if (depth_mm < self->rt_extreme) {
+                self->rt_extreme = depth_mm;
+            } else if (depth_mm >= cfg->actuation_mm &&
+                       (bottomed ||
+                        (press > 0.0f &&
+                         depth_mm - self->rt_extreme >= press))) {
+                out[n++]         = 1;
+                self->live       = 1;
+                self->rt_extreme = depth_mm;
+            }
+        }
+    } else if (!self->live && depth_mm >= cfg->actuation_mm) {
+        /* 3. Fresh actuation. */
+        self->live       = 1;
+        self->rt_extreme = depth_mm;
+        out[n++]         = 1;
+    }
+
+    return n;
+}
+
+
+/* Find the analog interface of an analog-capable keyboard. Returns the fd
+ * (and fills path/fmt), or -1 when there's nothing to open. An explicit
+ * path skips the vendor check but still has to look like an analog node. */
+static int analog_open(const char *forced, char *path_out, size_t path_sz,
+                       int *fmt_out, uint16_t *vid_out, uint16_t *pid_out) {
+    if (forced) {
+        const char *base = strrchr(forced, '/');
+        char sysdir[PATH_MAX];
+        snprintf(sysdir, sizeof(sysdir), "/sys/class/hidraw/%s",
+                 base ? base + 1 : forced);
+        int fmt = analog_probe_fmt(sysdir);
+        if (fmt == ANALOG_FMT_NONE) {
+            LOG_ERR("%s is not an analog interface "
+                    "(no 0xFF53/0xFF54 usage page)", forced);
+            return -1;
+        }
+        int fd = open(forced, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) {
+            LOG_ERR("open(%s): %s", forced, strerror(errno));
+            return -1;
+        }
+        analog_read_ids(sysdir, vid_out, pid_out);
+        snprintf(path_out, path_sz, "%s", forced);
+        *fmt_out = fmt;
+        return fd;
+    }
+
+    struct dirent **ents;
+    int n = scandir("/sys/class/hidraw", &ents, NULL, alphasort);
+    if (n < 0) return -1;
+
+    int fd = -1;
+    for (int i = 0; i < n; i++) {
+        if (fd < 0 && strncmp(ents[i]->d_name, "hidraw", 6) == 0) {
+            char     sysdir[PATH_MAX], dev[PATH_MAX];
+            uint16_t vid = 0, pid = 0;
+
+            snprintf(sysdir, sizeof(sysdir), "/sys/class/hidraw/%s",
+                     ents[i]->d_name);
+            if (analog_read_ids(sysdir, &vid, &pid) == 0 &&
+                (vid == WOOTING_VID || vid == WOOTING_VID_LEGACY)) {
+                int fmt = analog_probe_fmt(sysdir);
+                if (fmt != ANALOG_FMT_NONE) {
+                    snprintf(dev, sizeof(dev), "/dev/%s", ents[i]->d_name);
+                    int f = open(dev, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+                    if (f < 0) {
+                        LOG_WARN("open(%s): %s - analog unavailable "
+                                 "(udev rules? see README)",
+                                 dev, strerror(errno));
+                    } else {
+                        fd = f;
+                        *fmt_out = fmt;
+                        *vid_out = vid;
+                        *pid_out = pid;
+                        snprintf(path_out, path_sz, "%s", dev);
+                    }
+                }
+            }
+        }
+        free(ents[i]);
+    }
+    free(ents);
+    return fd;
+}
+
+/* hid-input stores a key's HID usage as its evdev scancode (usage page 0x07
+ * for ordinary keyboard keys), so the keyboard itself carries the mapping
+ * between config KEY_* codes and analog report usage ids. Walking its keymap
+ * beats hardcoding a table: it stays correct across layouts and firmware. */
+#define HID_PAGE_KEYBOARD 0x07
+
+static int hid_map_build(int fd, uint16_t *usage_of_key) {
+    int found = 0;
+    for (unsigned idx = 0; idx < KEY_MAX * 2; idx++) {
+        struct input_keymap_entry e;
+        uint32_t sc;
+
+        memset(&e, 0, sizeof(e));
+        e.flags = INPUT_KEYMAP_BY_INDEX;
+        e.index = idx;
+        if (ioctl(fd, EVIOCGKEYCODE_V2, &e) < 0)
+            break;                    /* EINVAL == walked off the end */
+        if (e.len != sizeof(sc) || e.keycode > KEY_MAX)
+            continue;
+        memcpy(&sc, e.scancode, sizeof(sc));
+        if ((sc >> 16) != HID_PAGE_KEYBOARD)
+            continue;
+        usage_of_key[e.keycode] = (uint16_t)(sc & 0xFFFF);
+        found++;
+    }
+    return found;
+}
+
+/* Walk every keyboard-shaped evdev node until one yields a usable keymap.
+ * Used both to resolve k1/k2 and to label codes in monitor mode. */
+static int hid_map_from_any_keyboard(const char *input_dir,
+                                     uint16_t *usage_of_key) {
+    struct dirent **ents;
+    int n = scandir(input_dir, &ents, is_event_node, alphasort);
+    if (n < 0) return 0;
+
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        if (!found) {
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%s", input_dir, ents[i]->d_name);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                found = hid_map_build(fd, usage_of_key);
+                close(fd);
+            }
+        }
+        free(ents[i]);
+    }
+    free(ents);
+    return found;
+}
+
+/* An open analog interface plus the SOCD state it drives. One per daemon:
+ * the analog path owns k1/k2 outright, so a second analog board would only
+ * fight the first over the same two virtual keys. */
+typedef struct {
+    int            kind;        /* EP_ANALOG */
+    int            fd;
+    int            fmt;
+    uint16_t       vid, pid;
+    uint16_t       usage[2];    /* HID usage id of k1, k2 */
+    char           path[PATH_MAX];
+    analog_state_t keys;
+    socd_state_t   socd;
+    int            deep;        /* 1 == both keys planted on the backplate;
+                                 * k1/k2 run the toggle instead of the
+                                 * plain remap. See analog_deep_update. */
+    int            last_press;  /* 0 == k1, 1 == k2: most recent press edge.
+                                 * Picks which key keeps its virtual on when
+                                 * the latch arms with both already
+                                 * down - last input wins. */
+} analog_dev_t;
+
+static analog_dev_t *analog_dev_open(const oid_config_t *cfg,
+                                     const char *input_dir) {
+    analog_dev_t *ad = calloc(1, sizeof(*ad));
+    if (!ad) {
+        LOG_ERR("oom");
+        return NULL;
+    }
+    ad->kind = EP_ANALOG;
+    ad->fd   = analog_open(cfg->analog.device, ad->path, sizeof(ad->path),
+                           &ad->fmt, &ad->vid, &ad->pid);
+    if (ad->fd < 0) {
+        free(ad);
+        return NULL;
+    }
+
+    /* Resolve k1/k2 to HID usage ids: an explicit config override wins,
+     * otherwise walk a keyboard's keymap for the mapping. */
+    static uint16_t usage_of_key[KEY_MAX + 1];
+    if (cfg->analog.hid_k1 < 0 || cfg->analog.hid_k2 < 0)
+        hid_map_from_any_keyboard(input_dir, usage_of_key);
+
+    ad->usage[0] = cfg->analog.hid_k1 >= 0 ? (uint16_t)cfg->analog.hid_k1
+                                           : usage_of_key[cfg->k1];
+    ad->usage[1] = cfg->analog.hid_k2 >= 0 ? (uint16_t)cfg->analog.hid_k2
+                                           : usage_of_key[cfg->k2];
+    if (!ad->usage[0] || !ad->usage[1]) {
+        LOG_ERR("could not resolve k1/k2 to HID usage ids - run with -A to "
+                "find them, then set analog.hid_k1 / analog.hid_k2");
+        close(ad->fd);
+        free(ad);
+        return NULL;
+    }
+
+    g_analog_vid = ad->vid;
+    g_analog_pid = ad->pid;
+
+    LOG_INFO("Analog input on %s (%s, %04x:%04x): k1 -> hid 0x%02x, "
+             "k2 -> hid 0x%02x", ad->path,
+             ad->fmt == ANALOG_FMT_V2 ? "v2" : "v1", ad->vid, ad->pid,
+             ad->usage[0], ad->usage[1]);
+    LOG_INFO("Analog thresholds: actuation %.2fmm, release %.2fmm "
+             "(derived), backplate at %.2fmm, rapid trigger %s",
+             (double)cfg->analog.actuation_mm, (double)cfg->analog.release_mm,
+             (double)(cfg->analog.travel_mm - cfg->analog.bottom_out_mm),
+             cfg->analog.rt_enabled ? "on" : "off");
+    LOG_INFO("SOCD engages while both keys are planted on the backplate "
+             "(deep latch); while engaged the backplate is the switch and "
+             "rapid trigger does not run; disengages when BOTH keys leave "
+             "the backplate - one finger lifting is a stroke, not an exit");
+    if (cfg->analog.rt_enabled) {
+        LOG_INFO("Rapid trigger (tapping only): press %.2fmm release %.2fmm"
+                 " - while riding, the backplate is the switch",
+                 (double)cfg->analog.rt_press_mm,
+                 (double)cfg->analog.rt_release_mm);
+    }
+    return ad;
+}
+
+static void analog_dev_close(analog_dev_t *ad) {
+    if (!ad) return;
+    if (ad->fd >= 0) close(ad->fd);
+    free(ad);
+}
+
+/* -A: dump live travel depth so thresholds can be picked against the real
+ * board, and so a key's usage id can be discovered when the keymap walk
+ * comes up empty. Deliberately touches nothing else - no grab, no uinput,
+ * no audio - so it is safe to run alongside a live daemon. */
+/* -T: dump the travel of k1/k2 to stdout, one line per hardware report,
+ * so a play session can be replayed through the state machine offline.
+ *
+ * Passive, exactly like -A: this opens the hidraw node and resolves the
+ * two HID usages, and does nothing else. No EVIOCGRAB, no uinput device,
+ * nothing in the input path - whoever is recording plays on their own
+ * setup, with their own keyboard behaving normally. That is what makes it
+ * reasonable to ask someone else to run it.
+ *
+ * Both keys are emitted on every line even when only one moved, because a
+ * released key vanishes from the report rather than reporting a zero, so
+ * the absent one really is at rest. Timestamps are monotonic microseconds
+ * from the first report. */
+static int analog_trace(const oid_config_t *cfg, const char *input_dir) {
+    analog_dev_t *ad = analog_dev_open(cfg, input_dir);
+    if (!ad)
+        return EXIT_FAILURE;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    printf("# doubletapd trace v1\n");
+    printf("# travel_mm=%.4f\n", (double)cfg->analog.travel_mm);
+    printf("us,k1_mm,k2_mm\n");
+    fflush(stdout);
+
+    LOG_INFO("Tracing k1/k2 travel to stdout. Play normally; Ctrl-C to stop.");
+
+    struct timespec t0;
+    int             have_t0 = 0;
+    unsigned long   lines   = 0;
+
+    while (g_running) {
+        struct pollfd pfd = { .fd = ad->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 200);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) continue;
+
+        unsigned char buf[ANALOG_V2_REPORT];
+        ssize_t       n = read(ad->fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) continue;
+            LOG_ERR("read(%s): %s", ad->path, strerror(errno));
+            break;
+        }
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (!have_t0) { t0 = now; have_t0 = 1; }
+        long long us = (long long)(now.tv_sec - t0.tv_sec) * 1000000
+                     + (now.tv_nsec - t0.tv_nsec) / 1000;
+
+        analog_sample_t s[ANALOG_SLOTS];
+        int             ns = analog_decode(ad->fmt, buf, (size_t)n, s,
+                                           ANALOG_SLOTS);
+        float depth[2] = { 0.0f, 0.0f };
+        for (int i = 0; i < ns; i++)
+            for (int k = 0; k < 2; k++)
+                if (s[i].code == ad->usage[k])
+                    depth[k] = s[i].depth * cfg->analog.travel_mm;
+
+        printf("%lld,%.4f,%.4f\n", us, (double)depth[0], (double)depth[1]);
+        lines++;
+    }
+
+    fflush(stdout);
+    LOG_INFO("Traced %lu reports.", lines);
+    analog_dev_close(ad);
+    return EXIT_SUCCESS;
+}
+
+static int analog_monitor(const char *forced, const char *input_dir,
+                          float travel_mm) {
+    char     path[PATH_MAX];
+    int      fmt = ANALOG_FMT_NONE;
+    uint16_t vid = 0, pid = 0;
+
+    int fd = analog_open(forced, path, sizeof(path), &fmt, &vid, &pid);
+    if (fd < 0) {
+        LOG_ERR("no analog interface found%s",
+                forced ? "" : " (is an analog keyboard connected?)");
+        return EXIT_FAILURE;
+    }
+
+    static uint16_t usage_of_key[KEY_MAX + 1];
+    char            name_of_usage[256][32];
+
+    memset(name_of_usage, 0, sizeof(name_of_usage));
+    hid_map_from_any_keyboard(input_dir, usage_of_key);
+    for (int code = 1; code <= KEY_MAX; code++) {
+        uint16_t u = usage_of_key[code];
+        if (!u || u >= 256 || name_of_usage[u][0])
+            continue;
+        const char *nm = libevdev_event_code_get_name(EV_KEY, code);
+        if (nm)
+            snprintf(name_of_usage[u], sizeof(name_of_usage[u]), "%s", nm);
+    }
+
+    LOG_INFO("Analog monitor on %s (%s, %04x:%04x), travel %.1fmm",
+             path, fmt == ANALOG_FMT_V2 ? "v2" : "v1", vid, pid, travel_mm);
+    LOG_INFO("Press keys to see live depth; peak is reported on release. "
+             "Ctrl-C to exit.");
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    float peak[256], cur[256];
+    memset(peak, 0, sizeof(peak));
+    memset(cur,  0, sizeof(cur));
+
+    while (g_running) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 200);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) continue;
+
+        unsigned char buf[ANALOG_V2_REPORT];
+        ssize_t       n = read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) continue;
+            LOG_ERR("read(%s): %s", path, strerror(errno));
+            break;
+        }
+
+        analog_sample_t s[ANALOG_SLOTS];
+        int             ns = analog_decode(fmt, buf, (size_t)n, s, ANALOG_SLOTS);
+
+        /* A released key drops out of the report entirely on at least some
+         * firmware, rather than reporting a final zero - so rest is inferred
+         * from absence, by diffing this frame against the last. */
+        float now[256];
+        memset(now, 0, sizeof(now));
+        for (int i = 0; i < ns; i++)
+            if (s[i].code < 256)
+                now[s[i].code] = s[i].depth;
+
+        for (int c = 0; c < 256; c++) {
+            if (now[c] > peak[c])
+                peak[c] = now[c];
+            if (now[c] > 0.0f || cur[c] <= 0.0f)
+                continue;
+            /* was down last frame, absent now: report and clear the peak */
+            const char *nm = name_of_usage[c][0] ? name_of_usage[c] : "?";
+            printf("\33[2K\r  %-14s hid 0x%02x   peak %5.2f mm  (%.3f)\n",
+                   nm, c, peak[c] * travel_mm, peak[c]);
+            peak[c] = 0.0f;
+        }
+        memcpy(cur, now, sizeof(cur));
+
+        /* Live line: everything currently off its rest position. */
+        char line[512];
+        int  off = 0, shown = 0;
+        for (int i = 0; i < ns && shown < 4; i++) {
+            if (s[i].depth <= 0.0f || s[i].code >= 256) continue;
+            const char *nm = name_of_usage[s[i].code][0]
+                           ? name_of_usage[s[i].code] : "?";
+            off += snprintf(line + off, sizeof(line) - (size_t)off,
+                            "  %s 0x%02x %5.2fmm", nm, s[i].code,
+                            s[i].depth * travel_mm);
+            shown++;
+            if (off >= (int)sizeof(line)) break;
+        }
+        printf("\33[2K\r%s", shown ? line : "  (all keys at rest)");
+        fflush(stdout);
+    }
+
+    printf("\33[2K\r");
+    fflush(stdout);
+    close(fd);
+    return EXIT_SUCCESS;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Virtual uinput device                                                     */
 /* ------------------------------------------------------------------------- */
 
@@ -1054,63 +2036,59 @@ static void destroy_virtual(void) {
  */
 enum { S_NONE = 0, S_RELEASE = 1, S_SINGLE = 2, S_PRESS = 3 };
 
-static int process_event(input_dev_t *in, const struct input_event *ie, const oid_config_t *cfg) {
-    if (ie->type == EV_MSC && ie->code == MSC_SCAN)
-        return 0;
+/* The SOCD core. Takes a synthesized (is_k1, value) edge rather than a raw
+ * evdev event so that both the evdev path and the analog path can drive it:
+ * process_event() below feeds it real key events, analog_drive() feeds it
+ * edges derived from travel depth. The transition logic is identical either
+ * way, which is the point. */
+static int socd_apply(socd_state_t *in, int is_k1, int value, int mode,
+                      const oid_config_t *cfg) {
+    in->mode = mode;
 
-    if (ie->type != EV_KEY ||
-        (ie->code != (unsigned)cfg->k1 && ie->code != (unsigned)cfg->k2)) {
-        libevdev_uinput_write_event(uidev, ie->type, ie->code, ie->value);
-        return 0;
-    }
-
-    int is_k1 = (ie->code == (unsigned)cfg->k1);
-
-    if (cfg->socd == SOCD_OFF) {
+    if (mode == SOCD_OFF) {
         /* k1/k2 still tracked so release_stuck can clean up a dying device.
          * Each key maps 1:1 to its own voice; both may sound if both are
          * pressed (they play on independent streams). */
-        if (ie->value != 2) {
-            if (is_k1) in->k1 = ie->value;
-            else       in->k2 = ie->value;
+        if (value != 2) {
+            if (is_k1) in->k1 = value;
+            else       in->k2 = value;
         }
         libevdev_uinput_write_event(uidev, EV_KEY,
-                                    is_k1 ? cfg->v1 : cfg->v2, ie->value);
+                                    is_k1 ? cfg->v1 : cfg->v2, value);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-        if (ie->value != 1)
+        if (value != 1)
             return VOICE_NONE;
         return is_k1 ? VOICE_V1 : VOICE_V2;
     }
 
-    if (ie->value == 2) /* autorepeat messes up state*/
+    if (value == 2) /* autorepeat messes up state*/
         return VOICE_NONE;
 
-    if (is_k1) in->k1 = ie->value;
-    else       in->k2 = ie->value;
+    if (is_k1) in->k1 = value;
+    else       in->k2 = value;
 
-    int state = in->k1 + in->k2 + ie->value;
+    int state = in->k1 + in->k2 + value;
     int triggered = VOICE_NONE;
 
     switch (state) {
-        case S_SINGLE:
+        case S_SINGLE: {
         int code = is_k1 ? cfg->v1 : cfg->v2;
-        int up_code; int down_code;
         in->act = is_k1;
-        in->last_was_k1 = is_k1;
         libevdev_uinput_write_event(uidev, EV_KEY, code, 1);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
         triggered = is_k1 ? VOICE_V1 : VOICE_V2;
         break;
+        }
         case S_RELEASE:
         /* Snappy mode: releasing the non-active (already suppressed) key
          * changes nothing; only the active key's release falls through to
          * the still-held one. Toggle mode reverts on either release. */
-        if (cfg->socd == SOCD_SNAPPY && is_k1 != in->act)
+        if (mode == SOCD_SNAPPY && is_k1 != in->act)
             break;
         /* fallthrough */
-        case S_PRESS:
-        up_code   = in->act ? cfg->v1 : cfg->v2;
-        down_code = in->act ? cfg->v2 : cfg->v1;
+        case S_PRESS: {
+        int up_code   = in->act ? cfg->v1 : cfg->v2;
+        int down_code = in->act ? cfg->v2 : cfg->v1;
         libevdev_uinput_write_event(uidev, EV_KEY, up_code, 0);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
         libevdev_uinput_write_event(uidev, EV_KEY, down_code, 1);
@@ -1119,12 +2097,14 @@ static int process_event(input_dev_t *in, const struct input_event *ie, const oi
         triggered = in->act ? VOICE_V2 : VOICE_V1;
         in->act = !in->act;
         break;
-        case S_NONE:
-        up_code = in->act ? cfg->v1 : cfg->v2;
+        }
+        case S_NONE: {
+        int up_code = in->act ? cfg->v1 : cfg->v2;
         libevdev_uinput_write_event(uidev, EV_KEY, up_code, 0);
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
         in->act = 0;
         break;
+        }
         default:
         /* shouldn't make it here w/ sane inputs. */
         break;
@@ -1133,16 +2113,31 @@ static int process_event(input_dev_t *in, const struct input_event *ie, const oi
     return triggered;
 }
 
+/* evdev entry point: mirror everything that isn't k1/k2, and hand k1/k2 to
+ * the SOCD core. In analog mode this device's k1/k2 are driven from travel
+ * depth instead, so the digital copies are dropped here to avoid emitting
+ * each press twice. */
+static int process_event(input_dev_t *in, const struct input_event *ie,
+                         const oid_config_t *cfg) {
+    if (ie->type == EV_MSC && ie->code == MSC_SCAN)
+        return VOICE_NONE;
+
+    if (ie->type != EV_KEY ||
+        (ie->code != (unsigned)cfg->k1 && ie->code != (unsigned)cfg->k2)) {
+        libevdev_uinput_write_event(uidev, ie->type, ie->code, ie->value);
+        return VOICE_NONE;
+    }
+
+    if (in->analog)
+        return VOICE_NONE;
+
+    return socd_apply(&in->socd, ie->code == (unsigned)cfg->k1, ie->value,
+                      cfg->socd, cfg);
+}
+
 /* ------------------------------------------------------------------------- */
 /* loop                                                                      */
 /* ------------------------------------------------------------------------- */
-
-static volatile sig_atomic_t g_running = 1;
-
-static void on_signal(int sig) {
-    (void)sig;
-    g_running = 0;
-}
 
 /* drain everything libevdev has buffered, looping over SYNC drops
  * as needed. return 0 on normal EAGAIN, -1 on fatal error. */
@@ -1185,12 +2180,294 @@ static int drain_device(input_dev_t *in, const oid_config_t *cfg) {
     return 0;
 }
 
+/* Which virtual keys `mode` would be holding down, given which physical
+ * keys `held` says are down. SOCD_OFF mirrors one-to-one; the toggle holds
+ * exactly one - the `act` one - whenever anything at all is held. Used to
+ * diff the two modes against each other when the `deep` latch changes
+ * under held fingers. */
+static void socd_virtual_state(const int *held, int act, int mode,
+                               int *down) {
+    down[0] = down[1] = 0;
+    if (mode == SOCD_OFF) {
+        down[0] = held[0];
+        down[1] = held[1];
+    } else if (held[0] || held[1]) {
+        down[act ? 0 : 1] = 1;
+    }
+}
+
+/* Arm or disarm the `deep` latch, reconciling the virtual keys as we go.
+ *
+ * The two modes disagree about what should be held: OFF wants a virtual key
+ * per held physical key, the toggle wants exactly one. Flipping the flag
+ * without settling that difference is what strands a key - the toggle can
+ * legitimately leave `act` on a finger that has already lifted, and a later
+ * release routed through OFF writes only its own code, so whatever the
+ * toggle pressed is never released. So compute both pictures and emit the
+ * difference.
+ *
+ * That matters MORE than it did when the latch cleared at release_mm:
+ * disarming at actuation_mm means the mode can flip with a finger still
+ * resting well down on a key, so a mode change under held fingers is
+ * routine rather than a corner.
+ *
+ * Arming with both keys already down - which is always, since arming means
+ * both are on the floor and the plain remap has pressed both - means one of
+ * them has to let go. The most recently pressed key keeps it: last input
+ * wins, the same principle the core runs on. Which one keeps it does NOT
+ * decide `act`; see analog_socd_edge. */
+static void analog_deep_set(analog_dev_t *ad, int on,
+                            const oid_config_t *cfg) {
+    /* Where the virtual keys stand comes from socd, which reflects the
+     * edges already APPLIED. Where they should end up comes from the
+     * front-end's `live`, which is this sample's truth - socd still lags it
+     * by whatever edges have not been routed yet. Targeting socd instead
+     * would press a key for a finger that left on this very sample, then
+     * release it again when the edge lands: a phantom note on the way out
+     * of a rock. */
+    int cur[2]  = { ad->socd.k1, ad->socd.k2 };
+    int next[2] = { ad->keys.key[0].live, ad->keys.key[1].live };
+    int from[2], to[2];
+
+    socd_virtual_state(cur, ad->socd.act,
+                       ad->deep ? cfg->socd : SOCD_OFF, from);
+
+    if (on) {
+        int keep = ad->last_press;
+        if (!next[keep]) keep = !keep;      /* it lifted; the other has it */
+        ad->socd.act = (keep == 0);
+    } else {
+        /* PARK both front ends on the way out. Disarming means neither key
+         * is on the floor, so nothing is held - but a key can still be well
+         * down (it need only have left the backplate), and the tapping
+         * profile is about to judge it against actuation_mm instead.
+         *
+         * Clearing `live` alone would let rule 3 read that depth as a FRESH
+         * actuation and press a finger that is on its way up - a phantom
+         * note landing exactly where a slider ends. Leaving `live` set is no
+         * better: its eventual release emits an up with no matching down,
+         * and socd_apply assumes strict alternation per key.
+         *
+         * `live = 0` with `rt_extreme` still holding the current depth is
+         * neither: it is rule 2's "engaged but not live" state, where the
+         * key tracks its extreme on the way up, emits nothing, and re-presses
+         * only on a real stroke - a bottom-out, or press_mm of down-travel.
+         * analog_key_feed's riding branch leaves rt_extreme parked for
+         * exactly this handoff. */
+        for (int k = 0; k < 2; k++)
+            ad->keys.key[k].live = 0;
+        next[0] = next[1] = 0;
+    }
+    ad->deep = on;
+    socd_virtual_state(next, ad->socd.act, on ? cfg->socd : SOCD_OFF, to);
+
+    /* Emit the difference. BOTH directions are release-only now, which is
+     * what the new disarm rule buys:
+     *
+     * ARMING goes from OFF's two keys down to the toggle's one. Planting is
+     * not a note, and both keys already sounded under OFF when they bottomed.
+     *
+     * DISARMING goes from the toggle's one to none. The old rule could fire
+     * with the other finger still planted deep, so it had to PRESS to avoid
+     * stranding that hold - at the cost of a second note for one lift. Under
+     * "both off the floor" there is by definition nobody still riding, so
+     * there is no survivor to strand and nothing to press. The parked front
+     * ends above pick the keys back up on their next real stroke.
+     *
+     * The audio_trigger call that used to sit here went with it: nothing
+     * here presses, so nothing here clicks. */
+    for (int k = 0; k < 2; k++) {
+        if (from[k] == to[k]) continue;
+        libevdev_uinput_write_event(uidev, EV_KEY,
+                                    k == 0 ? cfg->v1 : cfg->v2, to[k]);
+        libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+    }
+}
+
+/* Resolve the `deep` latch for this sample, before the sample's edges are
+ * applied.
+ *
+ * This is the whole discriminator between the two play patterns, and both
+ * halves are pure depth tests on the CURRENT frame - no per-key latch, no
+ * comparison of one key's depth against the other's. That last point is not
+ * an accident: every abandoned version of this feature gated on relative
+ * depth, trying to decide whether a shallow press "deserved" to steal from a
+ * deep one, and that is not a problem that exists. Do not reintroduce it.
+ *
+ * Deciding before the edges is what stops the lift that ends a rock from
+ * being reverted by a toggle on its way out: the release then lands as a
+ * plain release, over virtual keys the reconciliation has already put where
+ * SOCD_OFF expects them. */
+static void analog_deep_update(analog_dev_t *ad, const oid_config_t *cfg,
+                               const float *depth) {
+    const analog_config_t *a = &cfg->analog;
+
+    float floor_mm = a->travel_mm - a->bottom_out_mm;
+
+    if (ad->deep) {
+        /* BOTH fingers off the floor ends it. One key leaving is a stroke,
+         * not an exit - which is the whole point, and why the earlier rule
+         * (either key back past actuation_mm) was wrong. In a burst a finger
+         * routinely lifts clear of the switch while the other stays planted;
+         * that tore the latch down mid-gesture, and the next note then fired
+         * off the tapping profile at actuation instead of at the backplate.
+         * Measured on tests/toggle_5burst_3phys_5virt.csv: k2 sat at 3.5000
+         * throughout while k1 lifted to 0.0000, and note 4 landed 11.9ms
+         * early at 0.25mm instead of at 3.44mm. Two thresholds inside one
+         * burst is jitter, and "how completely you lift" is exactly the kind
+         * of amplitude-driven rule this design already rejects elsewhere. */
+        if (depth[0] < floor_mm && depth[1] < floor_mm) {
+            LOG_INFO("Deep latch cleared: k1 %.2fmm, k2 %.2fmm - both off "
+                     "the backplate (%.2fmm), back to the plain remap",
+                     (double)depth[0], (double)depth[1], (double)floor_mm);
+            analog_deep_set(ad, 0, cfg);
+        }
+        return;
+    }
+
+    /* Both against the backplate in ONE sample.
+     *
+     * Alt-tapping cannot satisfy this. Its defining shape is one finger
+     * leaving as the other arrives, so the two are never both on the floor
+     * together, however fast it is played and however much the presses
+     * overlap in the middle of travel. Rocking, by contrast, BEGINS by
+     * planting both - you cannot start one any other way. That asymmetry is
+     * the entire signal, and unlike a depth in the middle of travel the
+     * backplate is a hard physical stop: you can hit it without
+     * proprioception, and "plant both keys to start rocking" is an
+     * instruction a player can actually follow.
+     *
+     * Hysteresis is enormous by construction - on the defaults this arms at
+     * 3.80mm and disarms at 1.00mm - so there is no chatter and no need for
+     * a debounce counter. "One consecutive sample" IS the instantaneous
+     * test; if a longer confirmation is ever wanted it wraps this test and
+     * nothing else moves. */
+    if (depth[0] >= floor_mm && depth[1] >= floor_mm) {
+        /* Logged because arming is otherwise INVISIBLE: it is release-only
+         * by construction, it never clicks, and the first dip out of it
+         * reverts through two writes the kernel drops. With no trace of it
+         * anywhere, a latch that never arms and a latch that arms and works
+         * look identical from outside - which is exactly the question you
+         * are asking when the daemon seems stuck on the plain remap.
+         * Transitions are once per rock, not per report. */
+        LOG_INFO("Deep latch ARMED: k1 %.2fmm, k2 %.2fmm both at or past "
+                 "the backplate (%.2fmm) - SOCD toggle engaged",
+                 (double)depth[0], (double)depth[1], (double)floor_mm);
+        analog_deep_set(ad, 1, cfg);
+    }
+}
+
+/* Route one synthesized edge into the SOCD core under whatever mode the
+ * `deep` latch selects. The latch itself is resolved once per sample in
+ * analog_drain, before any of that sample's edges are applied. */
+static int analog_socd_edge(analog_dev_t *ad, int is_k1, int value,
+                            const oid_config_t *cfg) {
+    /* cfg->socd is SOCD_ANALOG here; socd_apply special-cases only OFF and
+     * SNAPPY, so ANALOG runs the toggle path. Deliberate, not accidental. */
+    int mode = ad->deep ? cfg->socd : SOCD_OFF;
+
+    /* `act` needs no lazy binding any more, and that is a consequence of the
+     * backplate rule rather than a separate fix.
+     *
+     * The old design had to defer it: arming released one virtual, and if the
+     * key that then dipped was the OTHER one, `act` named a key whose virtual
+     * was already up - so the handover wrote up(already-up) + down(already-
+     * down) and the kernel ate both. Deferring the binding to the first dip
+     * answered "which finger is leaving", but it made `act` lie about which
+     * virtual was down, which is what cost the note.
+     *
+     * Now arming leaves the picture in the toggle's canonical form - exactly
+     * one virtual down, and `act` names it truthfully - and every later edge
+     * is a plain backplate crossing. up(act) is always a real release and
+     * down(!act) always a real press, whichever finger moves. So the choice
+     * at arming is genuinely arbitrary, `act_bound` is gone, and so is the
+     * cycle that used to repair the no-op. */
+    int held[2] = { ad->socd.k1, ad->socd.k2 };
+    int before[2];
+    socd_virtual_state(held, ad->socd.act, mode, before);
+
+    if (value == 1)
+        ad->last_press = is_k1 ? 0 : 1;
+
+    int voice = socd_apply(&ad->socd, is_k1, value, mode, cfg);
+
+    int after[2];
+    held[0] = ad->socd.k1;
+    held[1] = ad->socd.k2;
+    socd_virtual_state(held, ad->socd.act, mode, after);
+
+    /* Claim a click only when the virtual picture actually moved. Under the
+     * backplate rule every toggle transition does, so this no longer has a
+     * repair to make - it stays as the guard that keeps the click and the
+     * emitted output in step, and regimetest asserts it never fires while
+     * riding. */
+    if (voice != VOICE_NONE &&
+        !(before[voice - 1] == 0 && after[voice - 1] == 1))
+        voice = VOICE_NONE;
+
+    return voice;
+}
+
+/* Read every queued analog report and turn travel depth into SOCD edges.
+ * A key absent from a report is at rest, so each frame is a complete
+ * picture rather than a delta: resolve the current depth of k1/k2, feed
+ * both to the front-end, and route whatever edges come back through the
+ * same core the evdev path uses. Returns -1 if the device died. */
+static int analog_drain(analog_dev_t *ad, const oid_config_t *cfg) {
+    for (;;) {
+        unsigned char buf[ANALOG_V2_REPORT];
+        ssize_t       n = read(ad->fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EINTR) continue;
+            LOG_WARN("read(%s): %s", ad->path, strerror(errno));
+            return -1;
+        }
+        if (n == 0)
+            return -1;
+
+        analog_sample_t s[ANALOG_SLOTS];
+        int             ns = analog_decode(ad->fmt, buf, (size_t)n, s,
+                                           ANALOG_SLOTS);
+
+        float depth[2] = { 0.0f, 0.0f };
+        for (int i = 0; i < ns; i++)
+            for (int k = 0; k < 2; k++)
+                if (s[i].code == ad->usage[k])
+                    depth[k] = s[i].depth * cfg->analog.travel_mm;
+
+        /* Feed both keys before judging either: engagement and lapse read
+         * the deep/live state of BOTH, which is only complete once both
+         * have been fed. The latch is then resolved BEFORE this sample's
+         * edges are applied, so every edge runs under the mode actually in
+         * force for it. That ordering is what stops the lift ending a
+         * rock from being reverted by a toggle on its way out - the
+         * release lands as a plain release, and the reconciliation in
+         * analog_deep_set has already put the virtual keys where OFF
+         * expects them. */
+        int edges[2][2], ne[2];
+        for (int k = 0; k < 2; k++)
+            ne[k] = analog_key_feed(&ad->keys, k, depth[k], &cfg->analog,
+                                    ad->deep, edges[k]);
+
+        analog_deep_update(ad, cfg, depth);
+
+        for (int k = 0; k < 2; k++)
+            for (int e = 0; e < ne[k]; e++) {
+                int voice = analog_socd_edge(ad, k == 0, edges[k][e], cfg);
+                if (voice != VOICE_NONE)
+                    audio_trigger(voice - 1);
+            }
+    }
+    return 0;
+}
+
 /* A device that dies while it holds k1/k2 would leave its active virtual
  * key stuck down forever; release it before dropping the device. */
-static void release_stuck(input_dev_t *in, const oid_config_t *cfg) {
+static void release_stuck(socd_state_t *in, const oid_config_t *cfg) {
     if (!(in->k1 || in->k2))
         return;
-    if (cfg->socd == SOCD_OFF) {
+    if (in->mode == SOCD_OFF) {
         /* no active-key tracking in off mode; both may be down */
         if (in->k1) {
             libevdev_uinput_write_event(uidev, EV_KEY, cfg->v1, 0);
@@ -1207,8 +2484,55 @@ static void release_stuck(input_dev_t *in, const oid_config_t *cfg) {
     libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
 }
 
+/* Bring the analog interface back after it has gone away.
+ *
+ * Losing it is survivable - the daemon drops to the evdev path rather than
+ * dying - but it used to be PERMANENT: the evdev node returns through the
+ * inotify reconcile while nothing ever retried the hidraw one, so a replug,
+ * a USB glitch or a suspend left the daemon quietly running the digital
+ * toggle under an analog config until someone restarted it. Silent, and
+ * indistinguishable from the state machine misbehaving.
+ *
+ * Nothing watches /sys/class/hidraw, so the evdev node coming back is the
+ * signal that the board is back; the analog node is retried alongside it.
+ * A failed retry is quiet (analog_open only complains about permissions,
+ * not absence), so this can run on every reconcile pass.
+ *
+ * The re-marking at the end is the part that is easy to miss. Devices that
+ * survived the outage had in->analog cleared when the board went away, and
+ * reconcile_devices only sets it on devices it OPENS - so without this the
+ * analog keyboard's digital k1/k2 would flow through on top of the analog
+ * path and every press would be emitted twice. */
+static void analog_reconcile(analog_dev_t **ad, analog_dev_t **adp,
+                             const oid_config_t *cfg, dev_list_t *devs,
+                             const char *input_dir, int epfd) {
+    if (cfg->socd != SOCD_ANALOG || *ad || devs->n == 0)
+        return;
+
+    analog_dev_t *n = analog_dev_open(cfg, input_dir);
+    if (!n)
+        return;
+
+    struct epoll_event ev = { .events = EPOLLIN, .data = { .ptr = n } };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, n->fd, &ev) < 0) {
+        LOG_WARN("epoll_ctl ADD analog: %s - staying on the digital path",
+                 strerror(errno));
+        analog_dev_close(n);
+        return;
+    }
+    *ad = *adp = n;
+
+    for (size_t d = 0; d < devs->n; d++)
+        devs->v[d]->analog =
+            libevdev_get_id_vendor(devs->v[d]->dev)  == (int)g_analog_vid &&
+            libevdev_get_id_product(devs->v[d]->dev) == (int)g_analog_pid;
+
+    LOG_INFO("Analog interface recovered - back on the analog path");
+}
+
 static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
-                    const char *input_dir) {
+                    const char *input_dir, analog_dev_t **adp) {
+    analog_dev_t *ad = *adp;   /* cleared through adp if it disappears */
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
         LOG_ERR("epoll_create1: %s", strerror(errno));
@@ -1235,6 +2559,15 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                      strerror(errno));
             close(ifd);
             ifd = -1;
+        }
+    }
+
+    if (ad) {
+        struct epoll_event ev = { .events = EPOLLIN, .data = { .ptr = ad } };
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, ad->fd, &ev) < 0) {
+            LOG_ERR("epoll_ctl ADD analog: %s", strerror(errno));
+            close(epfd);
+            return -1;
         }
     }
 
@@ -1269,6 +2602,24 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
                 continue;
             }
 
+            if (*(int *)events[i].data.ptr == EP_ANALOG) {
+                /* The analog board going away is not fatal: release
+                 * whatever it held and carry on with the evdev path. */
+                if ((events[i].events & (EPOLLERR | EPOLLHUP)) ||
+                    analog_drain(ad, cfg) < 0) {
+                    LOG_WARN("analog device %s gone; falling back to the "
+                             "digital path", ad->path);
+                    release_stuck(&ad->socd, cfg);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, ad->fd, NULL);
+                    g_analog_vid = g_analog_pid = 0;
+                    for (size_t d = 0; d < devs->n; d++)
+                        devs->v[d]->analog = 0;
+                    analog_dev_close(ad);
+                    ad = *adp = NULL;
+                }
+                continue;
+            }
+
             input_dev_t *in = events[i].data.ptr;
             int dead = 0;
 
@@ -1282,15 +2633,17 @@ static int run_loop(dev_list_t *devs, const oid_config_t *cfg,
             }
 
             if (dead) {
-                release_stuck(in, cfg);
+                release_stuck(&in->socd, cfg);
                 epoll_ctl(epfd, EPOLL_CTL_DEL, in->fd, NULL);
                 dev_list_remove(devs, in);
                 input_close(in);
                 free(in);
             }
         }
-        if (rescan)
+        if (rescan) {
             reconcile_devices(devs, cfg, input_dir, epfd, 0);
+            analog_reconcile(&ad, adp, cfg, devs, input_dir, epfd);
+        }
         if (devs->n == 0 && ifd < 0) {
             LOG_ERR("No devices left and hotplug unavailable - exiting");
             break;
@@ -1311,14 +2664,22 @@ static void print_usage(FILE *s, const char *prog) {
         "doubletapd - SOCD-cleaning input daemon\n"
         "\n"
         "Grabs evdev keyboard devices, applies a SOCD radio-button filter (reverting\n"
-        "toggle, snappy last-input-wins, or off, per the config's 'socd' field) to two\n"
-        "configurable keys, and re-emits everything via a\n"
+        "toggle, snappy last-input-wins, analog, or off, per the config's 'socd'\n"
+        "field) to two configurable keys, and re-emits everything via a\n"
         "single uinput virtual keyboard. Plays a click on each virtual keypress.\n"
         "\n"
-        "usage: %s [-h] [-c CONFIG] [-i DIR]\n"
+        "'analog' needs an analog keyboard: it runs 'off' while you alt-tap and\n"
+        "switches to the toggle while you rock, deciding between them on how far\n"
+        "the keys are actually pressed, and adds a software rapid trigger.\n"
+        "\n"
+        "usage: %s [-h] [-A|-T] [-c CONFIG] [-i DIR]\n"
         "\n"
         "options:\n"
         "    -h          show this help and exit\n"
+        "    -A          analog monitor: print live key travel depth and exit\n"
+        "                (for picking thresholds; grabs nothing)\n"
+        "    -T          trace k1/k2 travel as CSV on stdout until Ctrl-C\n"
+        "                (grabs nothing; replay it with the `replay` tool)\n"
         "    -c CONFIG   path to YAML config\n"
         "    -i DIR      directory to scan/watch for event devices\n"
         "                (default /dev/input; mainly for testing)\n"
@@ -1356,12 +2717,20 @@ int
 main(int argc, char **argv) {
     const char *config_path = NULL;
     const char *input_dir   = "/dev/input";
+    int         monitor     = 0;
+    int         trace       = 0;
 
-    for (int opt; (opt = getopt(argc, argv, "hc:i:")) != -1; ) {
+    for (int opt; (opt = getopt(argc, argv, "hATc:i:")) != -1; ) {
         switch (opt) {
             case 'h':
             print_usage(stdout, argv[0]);
             return EXIT_SUCCESS;
+            case 'A':
+            monitor = 1;
+            break;
+            case 'T':
+            trace = 1;
+            break;
             case 'c':
             config_path = optarg;
             break;
@@ -1383,6 +2752,19 @@ main(int argc, char **argv) {
     if (load_config(config_path, &cfg) != 0)
         return EXIT_FAILURE;
 
+    if (trace) {
+        int rc = analog_trace(&cfg, input_dir);
+        config_free(&cfg);
+        return rc;
+    }
+
+    if (monitor) {
+        int rc = analog_monitor(cfg.analog.device, input_dir,
+                                cfg.analog.travel_mm);
+        config_free(&cfg);
+        return rc;
+    }
+
     const char *k1n = libevdev_event_code_get_name(EV_KEY, cfg.k1);
     const char *k2n = libevdev_event_code_get_name(EV_KEY, cfg.k2);
     const char *v1n = libevdev_event_code_get_name(EV_KEY, cfg.v1);
@@ -1398,7 +2780,8 @@ main(int argc, char **argv) {
              k1n ? k1n : "?", cfg.k1, k2n ? k2n : "?", cfg.k2,
              v1n ? v1n : "?", cfg.v1, v2n ? v2n : "?", cfg.v2,
              cfg.socd == SOCD_SNAPPY ? "snappy"
-                 : cfg.socd == SOCD_OFF ? "off" : "toggle",
+                 : cfg.socd == SOCD_OFF    ? "off"
+                 : cfg.socd == SOCD_ANALOG ? "analog" : "toggle",
              cfg.audio_enabled ? "enabled" : "disabled");
 
 	/* use rt scheduler if we can */
@@ -1463,10 +2846,22 @@ main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    /* Open the analog interface before the first reconcile pass, so newly
+     * grabbed keyboards already know their k1/k2 are analog-driven. */
+    analog_dev_t *ad = NULL;
+    if (cfg.socd == SOCD_ANALOG) {
+        ad = analog_dev_open(&cfg, input_dir);
+        if (!ad)
+            LOG_WARN("Analog input unavailable - falling back to the "
+                     "digital reverting toggle");
+    }
+
     /* run_loop opens/grabs devices itself (initial reconcile + hotplug). */
     dev_list_t devs = { 0 };
     LOG_INFO("Running.");
-    int rc = run_loop(&devs, &cfg, input_dir);
+    int rc = run_loop(&devs, &cfg, input_dir, &ad);
+
+    analog_dev_close(ad);
     LOG_INFO("Shutting down");
 
     destroy_virtual();

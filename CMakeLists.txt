@@ -62,6 +62,37 @@ target_link_libraries(doubletapd PRIVATE
     ${LIBYAML_LIBRARIES}
 )
 
+# Developer tools. Not installed, but deliberately part of the default build:
+# each #includes doubletapd.c so it exercises the daemon's own state machine
+# rather than a copy, and that guarantee is worthless if the binary can go
+# stale. EXCLUDE_FROM_ALL let `cmake --build build` skip them silently, which
+# produced a `replay` validating configs against rules the daemon no longer
+# had. A few seconds of build time is the cheaper mistake.
+#   ./build/replay TRACE.csv   replay a `doubletapd -T` recording
+#   ./build/regimetest         assertions over the regime
+foreach(tool replay regimetest)
+    add_executable(${tool} tools/${tool}.c)
+
+    target_compile_definitions(${tool} PRIVATE
+        DEF_WAV="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/click.wav"
+        DEF_CONFIG="${CMAKE_INSTALL_FULL_DATADIR}/doubletap/config.yaml"
+    )
+    target_compile_options(${tool} PRIVATE
+        -Wall -Wextra
+        ${PIPEWIRE_CFLAGS_OTHER} ${LIBEVDEV_CFLAGS_OTHER} ${LIBYAML_CFLAGS_OTHER}
+    )
+    target_include_directories(${tool} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PIPEWIRE_INCLUDE_DIRS} ${LIBEVDEV_INCLUDE_DIRS} ${LIBYAML_INCLUDE_DIRS}
+    )
+    target_link_directories(${tool} PRIVATE
+        ${PIPEWIRE_LIBRARY_DIRS} ${LIBEVDEV_LIBRARY_DIRS} ${LIBYAML_LIBRARY_DIRS}
+    )
+    target_link_libraries(${tool} PRIVATE
+        ${PIPEWIRE_LIBRARIES} ${LIBEVDEV_LIBRARIES} ${LIBYAML_LIBRARIES}
+    )
+endforeach()
+
 configure_file(doubletap.service.in doubletap.service @ONLY)
 
 install(TARGETS doubletapd RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
