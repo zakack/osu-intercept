@@ -3,12 +3,12 @@
  * mixtest - assertions over the audio voice pool, the trigger ring and the
  * summed output buffer.
  *
- * Includes doubletapd.c and calls the daemon's own audio_trigger() and
+ * Includes doubletapd.c and calls the daemon's own trigger() and
  * audio_mix(), so it exercises the real mixer rather than a copy. There is
  * no PipeWire here at all: audio_mix takes a plain float buffer, which is
  * exactly why the mix was factored out of on_process.
  *
- * Triggers go in through audio_trigger() rather than by poking audio.voice[]
+ * Triggers go in through trigger() rather than by poking audio.voice[]
  * directly. The ring IS the boundary between the input thread and the RT
  * thread, and a bug there is the kind that lives for six months.
  *
@@ -57,6 +57,22 @@ static float cell(int s, size_t f, int c) {
     return (float)(s + 1) * 0.03f + (float)f * 0.00001f + (float)c * 0.007f;
 }
 
+/* Triggers still go in through the daemon's own audio_trigger - the ring IS
+ * the thread boundary - but through wrappers that name the two intents.
+ *
+ * trigger() passes a zero timestamp, which mix_drain_triggers reads as "no
+ * placement information" and puts at frame 0. That is deliberately what every
+ * case below A..M asserts against: they predate sub-buffer placement and are
+ * the regression gate on the mixer proper, so they must keep testing the
+ * mixer and not the clock. Cases N and O are the placement path. */
+static void trigger(int sample) {
+    audio_trigger(sample, 0);
+}
+
+static void trigger_at(int sample, uint64_t t_ns) {
+    audio_trigger(sample, t_ns);
+}
+
 /* Reset the whole audio subsystem: samples, pool, ring. Nothing here reaches
  * into internals the daemon does not own - it is the startup state. */
 static void fresh(float gain0, float gain1) {
@@ -76,7 +92,7 @@ static void fresh(float gain0, float gain1) {
 
 static void render(size_t nframes) {
     memset(out, 0x7f, sizeof out);   /* poison: silence must be written, not left */
-    audio_mix(out, nframes);
+    audio_mix(out, nframes, 0);
 }
 
 static int active_voices(void) {
@@ -94,7 +110,7 @@ int main(void) {
     expect_f("  and the buffer is silence, not poison", out[0], 0.0f);
     expect_f("  right to the end", out[BUF * MIX_CHANNELS - 1], 0.0f);
 
-    audio_trigger(0);
+    trigger(0);
     render(BUF);
     expect_int("triggered: one voice", active_voices(), 1);
     expect_f("  first frame, left",  out[0], cell(0, 0, 0));
@@ -110,7 +126,7 @@ int main(void) {
 
     puts("B. gain scales the voice, and it is the SAMPLE's gain");
     fresh(0.5f, 1.0f);
-    audio_trigger(0);
+    trigger(0);
     render(BUF);
     expect_f("half gain", out[0], cell(0, 0, 0) * 0.5f);
 
@@ -120,9 +136,9 @@ int main(void) {
      * was being cut at 40% on every note of a stream. Each trigger now owns
      * a voice, so the tail survives underneath the new note. */
     fresh(1.0f, 1.0f);
-    audio_trigger(0);
+    trigger(0);
     render(BUF);                       /* first voice advances BUF frames */
-    audio_trigger(0);                  /* second tap, same key */
+    trigger(0);                  /* second tap, same key */
     render(BUF);
     expect_int("two voices, same sample", active_voices(), 2);
     expect_f("  the new note plus the OLD ONE'S TAIL",
@@ -133,8 +149,8 @@ int main(void) {
 
     puts("D. distinct samples mix rather than clobber");
     fresh(1.0f, 1.0f);
-    audio_trigger(0);
-    audio_trigger(1);
+    trigger(0);
+    trigger(1);
     render(BUF);
     expect_int("two voices", active_voices(), 2);
     expect_f("  v1 + v2", out[0], cell(0, 0, 0) + cell(1, 0, 0));
@@ -148,7 +164,7 @@ int main(void) {
      * the end or emitting one extra frame are the two classic off-by-ones,
      * and a sample shorter than a buffer catches neither. */
     fresh(1.0f, 1.0f);
-    audio_trigger(0);
+    trigger(0);
     render(SLEN - BUF);                       /* leave exactly BUF frames */
     expect_int("still playing with one buffer to go", active_voices(), 1);
     render(BUF);
@@ -161,7 +177,7 @@ int main(void) {
 
     puts("F. a voice ending mid-buffer zeroes the rest");
     fresh(1.0f, 1.0f);
-    audio_trigger(0);
+    trigger(0);
     render(SLEN - 10);
     render(BUF);
     expect_f("last real frame", out[9 * MIX_CHANNELS], cell(0, SLEN - 1, 0));
@@ -172,7 +188,7 @@ int main(void) {
     fresh(1.0f, 1.0f);
     /* One trigger per render, so the voices differ in how far they have
      * advanced and the oldest is identifiable by its position. */
-    for (int i = 0; i < AUDIO_MAX_VOICES; i++) { audio_trigger(0); render(1); }
+    for (int i = 0; i < AUDIO_MAX_VOICES; i++) { trigger(0); render(1); }
     expect_int("pool full", active_voices(), AUDIO_MAX_VOICES);
     /* The oldest has advanced AUDIO_MAX_VOICES frames, the newest 1. */
     size_t oldest = 0;
@@ -181,7 +197,7 @@ int main(void) {
     expect_int("  oldest is the furthest along",
                (long long)oldest, AUDIO_MAX_VOICES);
 
-    audio_trigger(0);
+    trigger(0);
     render(1);
     expect_int("one more trigger: still exactly the pool size",
                active_voices(), AUDIO_MAX_VOICES);
@@ -198,7 +214,7 @@ int main(void) {
 
     puts("H. a full ring DROPS and counts, it does not block or corrupt");
     fresh(1.0f, 1.0f);
-    for (int i = 0; i < TRIG_RING + 7; i++) audio_trigger(0);
+    for (int i = 0; i < TRIG_RING + 7; i++) trigger(0);
     expect_int("overruns counted", (long long)atomic_load(&trig.overruns), 7);
     render(1);
     /* TRIG_RING > AUDIO_MAX_VOICES, so the pool caps what survives; what
@@ -215,7 +231,7 @@ int main(void) {
      * never fills: head and tail must chase each other around the buffer
      * without ever losing one. */
     for (int i = 0; i < TRIG_RING * 5; i++) {
-        audio_trigger(0);
+        trigger(0);
         render(SLEN);            /* long enough to retire it immediately */
         if (active_voices() != 0) {
             printf("  FAIL  wrap iteration %d left a voice active\n", i);
@@ -232,7 +248,7 @@ int main(void) {
 
     puts("J. the sum is clamped, never NaN");
     fresh(4.0f, 4.0f);
-    for (int i = 0; i < AUDIO_MAX_VOICES; i++) audio_trigger(i & 1);
+    for (int i = 0; i < AUDIO_MAX_VOICES; i++) trigger(i & 1);
     render(BUF);
     expect_int("pool full of loud voices", active_voices(), AUDIO_MAX_VOICES);
     {
@@ -249,15 +265,15 @@ int main(void) {
     puts("K. audio_trigger is inert when there is nothing to play");
     fresh(1.0f, 1.0f);
     audio_available = 0;
-    audio_trigger(0);
+    trigger(0);
     expect_int("audio off: nothing queued",
                (long long)atomic_load(&trig.head), 0);
     audio_available = 1;
-    audio_trigger(-1); audio_trigger(AUDIO_NSAMPLES);
+    trigger(-1); trigger(AUDIO_NSAMPLES);
     expect_int("out-of-range sample id: nothing queued",
                (long long)atomic_load(&trig.head), 0);
     audio.sample[1].samples = NULL;
-    audio_trigger(1);
+    trigger(1);
     expect_int("unmapped sample: nothing queued",
                (long long)atomic_load(&trig.head), 0);
 
@@ -311,6 +327,102 @@ int main(void) {
         memset(&s, 0, sizeof s);
         expect_int("a zero-frame sample is rejected, not mixed",
                    sample_conform(half, 0, 1, MIX_RATE, &s), -1);
+    }
+
+    /* --------------------------------------------------------------- *
+     * Sub-buffer placement. The events drained in one cycle arrived
+     * anywhere across the previous one, so dropping them all at frame 0
+     * quantises every burst to the graph quantum. The drain maps the
+     * window [cycle_ns - nframes, cycle_ns) onto [0, nframes) instead,
+     * trading one fixed quantum of latency for no jitter at all.
+     * --------------------------------------------------------------- */
+    puts("N. sub-buffer placement");
+    {
+        /* A cycle far from zero, so nothing here passes by accident on a
+         * small number. One buffer of BUF frames spans this many ns: */
+        const uint64_t span   = (uint64_t)BUF * 1000000000ull / MIX_RATE;
+        const uint64_t cycle  = 4000000000ull;
+
+        /* Exactly one buffer old -> the very start. */
+        fresh(1.0f, 1.0f);
+        trigger_at(0, cycle - span);
+        memset(out, 0x7f, sizeof out);
+        audio_mix(out, BUF, cycle);
+        expect_f("a full buffer old lands at frame 0", out[0], cell(0, 0, 0));
+
+        /* Half a buffer old -> halfway in, with silence before it. */
+        fresh(1.0f, 1.0f);
+        trigger_at(0, cycle - span / 2);
+        memset(out, 0x7f, sizeof out);
+        audio_mix(out, BUF, cycle);
+        expect_f("half a buffer old: silence at frame 0", out[0], 0.0f);
+        expect_f("  silence right up to the offset",
+                 out[(BUF / 2 - 1) * MIX_CHANNELS], 0.0f);
+        expect_f("  and the sample starts at frame BUF/2",
+                 out[(BUF / 2) * MIX_CHANNELS], cell(0, 0, 0));
+        expect_f("  frame 1 of the sample follows it",
+                 out[(BUF / 2 + 1) * MIX_CHANNELS], cell(0, 1, 0));
+
+        /* THE POINT OF ALL THIS: two triggers a known distance apart come
+         * out that same distance apart, inside one buffer. Frame 0 for
+         * both is what this replaces. */
+        fresh(1.0f, 1.0f);
+        trigger_at(0, cycle - span * 3 / 4);
+        trigger_at(1, cycle - span / 4);
+        memset(out, 0x7f, sizeof out);
+        audio_mix(out, BUF, cycle);
+        expect_f("two triggers keep their spacing: first at BUF/4",
+                 out[(BUF / 4) * MIX_CHANNELS], cell(0, 0, 0));
+        expect_f("  second at 3*BUF/4, and they do not collide",
+                 out[(BUF * 3 / 4) * MIX_CHANNELS],
+                 cell(1, 0, 0) + cell(0, BUF / 2, 0));
+        expect_int("  both are playing", active_voices(), 2);
+
+        /* A voice placed near the end straddles the boundary: what did not
+         * fit carries into the next buffer, from ITS frame 0. */
+        fresh(1.0f, 1.0f);
+        trigger_at(0, cycle - span / BUF);   /* one frame old -> last frame */
+        memset(out, 0x7f, sizeof out);
+        audio_mix(out, BUF, cycle);
+        expect_f("a late trigger reaches the last frame",
+                 out[(BUF - 1) * MIX_CHANNELS], cell(0, 0, 0));
+        memset(out, 0x7f, sizeof out);
+        audio_mix(out, BUF, cycle + span);
+        expect_f("  and continues from frame 0 of the next buffer",
+                 out[0], cell(0, 1, 0));
+    }
+
+    puts("O. placement degrades to frame 0, never to silence");
+    {
+        const uint64_t span  = (uint64_t)BUF * 1000000000ull / MIX_RATE;
+        const uint64_t cycle = 4000000000ull;
+
+        /* A stale trigger - a backlog, a stalled epoll loop - must play at
+         * once rather than be pushed off the front of the buffer. */
+        fresh(1.0f, 1.0f);
+        trigger_at(0, cycle - span * 50);
+        memset(out, 0x7f, sizeof out);
+        audio_mix(out, BUF, cycle);
+        expect_f("a stale trigger clamps to frame 0", out[0], cell(0, 0, 0));
+
+        /* A timestamp from the future (a clock the daemon does not control,
+         * or a report stamped a hair after the cycle snapshot) must stay
+         * inside the buffer rather than run off the end of it. */
+        fresh(1.0f, 1.0f);
+        trigger_at(0, cycle + span);
+        memset(out, 0x7f, sizeof out);
+        audio_mix(out, BUF, cycle);
+        expect_int("a future trigger still plays", active_voices(), 1);
+        expect_f("  clamped to the last frame",
+                 out[(BUF - 1) * MIX_CHANNELS], cell(0, 0, 0));
+
+        /* No cycle time at all - pw_stream_get_time_n failed - is the old
+         * behaviour, and must stay it. */
+        fresh(1.0f, 1.0f);
+        trigger_at(0, cycle - span / 2);
+        memset(out, 0x7f, sizeof out);
+        audio_mix(out, BUF, 0);
+        expect_f("no cycle time: back to frame 0", out[0], cell(0, 0, 0));
     }
 
     printf("\n%s\n", fails ? "FAILURES ABOVE" : "all assertions passed");

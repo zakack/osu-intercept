@@ -95,8 +95,11 @@ keys:
 #   gain_v1 / gain_v2 - separate volumes (each falls back to `gain`)
 # Setting `wav` alongside a single override is fine (not a conflict): the
 # override wins for its key, `wav` covers the other. Point samples at any
-# 16/24/32-bit PCM WAV, at any sample rate - the daemon resamples once at
-# startup so everything shares one output.
+# format libsndfile reads - WAV (any bit depth, including float and
+# WAVE_FORMAT_EXTENSIBLE), FLAC, OGG/Vorbis, Opus and MP3 - at any sample
+# rate and channel count. An osu! skin's hitsounds work as they ship, with no
+# transcoding. The daemon decodes and resamples once at startup so everything
+# shares one output.
 #
 # EVERY click overlaps rather than cutting off the one before it, including
 # two presses of the SAME key. The daemon opens a single output node and
@@ -105,10 +108,24 @@ keys:
 # 125ms and a 300 BPM stream is one tap every 50ms, so anything that
 # restarted playback would clip every note of a burst to 40% and thin out
 # the sound exactly when you are listening hardest.
+#
+# `latency` is the output quantum requested from PipeWire, in frames at 48kHz.
+# Without it the node inherits the graph quantum - 1024 on a stock PipeWire,
+# so a click landed anywhere in a 21ms window and a burst came out unevenly
+# spaced. 256 frames is 5.3ms, and a trigger is placed at the frame it
+# actually fell on within that buffer, so the spacing between two taps
+# survives to the speaker.
+#
+# Lower is not free, and the cost is not local: PipeWire runs the WHOLE graph
+# at the minimum latency any node asks for, so this daemon holds the entire
+# session at whatever you set here for as long as it runs. 256 is right for
+# wired output; a Bluetooth headset or a loaded machine may want 512 or 1024
+# (and will crackle if you insist otherwise). Range 16..8192.
 audio:
   enabled: true
   wav: /usr/share/doubletap/click.wav
   gain: 1.0
+  latency: 256
   # wav_v1: /usr/share/doubletap/click.wav
   # wav_v2: /usr/share/doubletap/clack.wav
   # gain_v1: 1.0
