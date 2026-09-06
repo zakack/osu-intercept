@@ -115,7 +115,7 @@ static analog_dev_t ad;
 static void sample(float d0, float d1) {
     float d[POOL_MAX] = { d0, d1 };
     reset_log();
-    analog_report(&ad, &cfg, d);
+    analog_report(&ad, &cfg, d, 0);
 }
 
 /* ---------------------------------------------------------------------- *
@@ -211,7 +211,7 @@ static void dtap(int i) {
 static void sample4(float a, float b, float c, float d) {
     float dep[POOL_MAX] = { a, b, c, d };
     reset_log();
-    analog_report(&ad, &cfg, dep);
+    analog_report(&ad, &cfg, dep, 0);
 }
 
 static void fresh4(void) {

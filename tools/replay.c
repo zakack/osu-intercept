@@ -153,7 +153,9 @@ static void replay_run(const trace_t *tr, const oid_config_t *cfg,
          * ordering inside analog_report is load-bearing and a copy here
          * would be free to drift while still passing replay's own checks. */
         float depth[POOL_MAX] = { tr->f[i].mm[0], tr->f[i].mm[1] };
-        analog_report(&ad, cfg, depth);
+        /* The trace's own timestamp, so the placement path sees real
+         * inter-report spacing rather than a synthetic constant. */
+        analog_report(&ad, cfg, depth, (uint64_t)tr->f[i].us * 1000ull);
 
         if (!was && ad.deep) {
             g_run.engagements++;
