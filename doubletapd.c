@@ -54,6 +54,7 @@
 #include <libevdev/libevdev.h>
 #include <libevdev/libevdev-uinput.h>
 
+#include <samplerate.h>
 #include <yaml.h>
 
 #include <spa/param/audio/format-utils.h>
@@ -130,37 +131,74 @@ static void on_signal(int sig) {
 
 static int audio_available;
 
-/* One playback voice: an independently loaded sample driven by its own
- * PipeWire stream. V1 keypresses trigger voice 0, V2 voice 1. The two
- * streams are fully independent so a V1 click and a V2 click overlap
- * rather than cutting each other off. */
-#define AUDIO_NVOICES 2
+/* The mixer's internal format. FIXED at compile time rather than derived
+ * from whatever loaded: the WAV loader has to know its resampling target
+ * before it runs, and deriving the rate from "the first sample that opened
+ * successfully" would make the graph's rate depend on which load failed.
+ * 48kHz is PipeWire's default graph rate, so the shipped click costs
+ * nothing to play. */
+#define MIX_RATE     48000
+#define MIX_CHANNELS 2
+
+/* Distinct mapped samples. Two today (V1's click and V2's), but the table is
+ * indexed by sample id and nothing below counts on the 2: how many samples
+ * are MAPPED and how many sounds can be IN FLIGHT are different numbers now,
+ * which is the whole point of the voice pool. */
+#define AUDIO_NSAMPLES 2
+
+/* Concurrent sounds. Far more than a pair of fingers can ask for; the pool
+ * is ~1KB static and exhaustion is a formality (see mix_voice_alloc). */
+#define AUDIO_MAX_VOICES 32
+
+/* Trigger ring depth. Power of two, indexed by free-running counters. */
+#define TRIG_RING 64
 
 /* process_event() return codes: which virtual key it emitted a press for
- * (and thus which hitsound voice to trigger). 0 = no press this event. */
+ * (and thus which hitsound sample to trigger). 0 = no press this event. */
 #define VOICE_NONE 0
 #define VOICE_V1   1
 #define VOICE_V2   2
 
+/* A loaded, CONFORMED sample: interleaved float at MIX_RATE/MIX_CHANNELS.
+ * All rate and channel conversion happened at load time, so nothing in the
+ * RT callback has to know what the file on disk looked like. */
 typedef struct {
-    float                    *samples;
-    size_t                    num_frames;
-    int                       channels;
-    int                       sample_rate;
-    float                     gain;      /* linear multiplier, 1.0 = unity */
+    float  *samples;
+    size_t  num_frames;
+    float   gain;        /* linear multiplier, 1.0 = unity */
+} audio_sample_t;
 
-    struct pw_stream         *stream;
-
-    atomic_int                pending;
-    atomic_bool               playing;
-    atomic_bool               reset;
-    atomic_size_t             frame_pos;
-} audio_voice_t;
+/* A PLAYING INSTANCE of a sample. This is the thing a keypress allocates.
+ * Owned exclusively by the RT thread - only audio_mix() ever reads or writes
+ * one - which is why there is not an atomic in sight here. */
+typedef struct {
+    const float *samples;   /* borrowed from audio.sample[]; RT never frees */
+    size_t       nframes;
+    size_t       pos;
+    float        gain;
+    uint32_t     seq;       /* allocation order, for oldest-steal */
+    bool         active;
+} mix_voice_t;
 
 static struct {
-    struct pw_thread_loop    *loop;      /* one thread loop drives both voices */
-    audio_voice_t             voice[AUDIO_NVOICES];
+    struct pw_thread_loop *loop;
+    struct pw_stream      *stream;    /* ONE node, whatever is mapped */
+    audio_sample_t         sample[AUDIO_NSAMPLES];
+    mix_voice_t            voice[AUDIO_MAX_VOICES];
+    uint32_t               seq_next;  /* RT-thread private, like the pool */
 } audio;
+
+/* The ONLY state shared between the epoll thread and the RT thread.
+ * Single-producer/single-consumer: the producer is the epoll loop and only
+ * the epoll loop (process_event and ANALOG_CLICK both run there), the
+ * consumer is audio_mix(). head and tail free-run and wrap; the unsigned
+ * difference is the fill level. */
+static struct {
+    uint8_t     slot[TRIG_RING];   /* sample index */
+    atomic_uint head;              /* producer writes */
+    atomic_uint tail;              /* consumer writes */
+    atomic_uint overruns;          /* triggers dropped on a full ring */
+} trig;
 
 typedef struct { char id[4]; uint32_t size; } wav_chunk;
 typedef struct {
@@ -172,11 +210,15 @@ typedef struct {
     uint16_t bps;
 } wav_fmt;
 
-static int wav_load(const char *path, audio_voice_t *v) {
+/* Pure decoder: RIFF/WAVE in, interleaved float out. Knows nothing about the
+ * mix format - conforming to it is sample_conform's job, kept separate so
+ * the loader stays testable against a buffer with no file behind it. */
+static float *wav_load(const char *path, size_t *frames_out,
+                       int *ch_out, int *rate_out) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         LOG_WARN("Cannot open WAV %s: %s", path, strerror(errno));
-        return -1;
+        return NULL;
     }
 
     char riff[4]; uint32_t rsize; char wave[4];
@@ -185,7 +227,7 @@ static int wav_load(const char *path, audio_voice_t *v) {
         memcmp(riff, "RIFF", 4) || memcmp(wave, "WAVE", 4)) {
         fclose(f);
         LOG_WARN("Not a RIFF/WAVE file: %s", path);
-        return -1;
+        return NULL;
     }
 
     wav_fmt fmt = {0};
@@ -196,7 +238,7 @@ static int wav_load(const char *path, audio_voice_t *v) {
         if (fread(&ch, sizeof(ch), 1, f) != 1) break;
         if (!memcmp(ch.id, "fmt ", 4)) {
             size_t rs = ch.size < sizeof(fmt) ? ch.size : sizeof(fmt);
-            if (fread(&fmt, rs, 1, f) != 1) { fclose(f); return -1; }
+            if (fread(&fmt, rs, 1, f) != 1) { fclose(f); return NULL; }
             if (ch.size > sizeof(fmt))
                 fseek(f, (long)(ch.size - sizeof(fmt)), SEEK_CUR);
         } else if (!memcmp(ch.id, "data", 4)) {
@@ -209,125 +251,229 @@ static int wav_load(const char *path, audio_voice_t *v) {
     if (fmt.fmt != 1 || ds == 0 || fmt.bps == 0 || fmt.ch == 0) {
         fclose(f);
         LOG_WARN("Unsupported WAV format in %s", path);
+        return NULL;
+    }
+
+    size_t frames = ds / (fmt.bps / 8u) / fmt.ch;
+    float *out = calloc(frames * fmt.ch, sizeof(float));
+    if (!out) { fclose(f); return NULL; }
+
+    uint8_t *raw = malloc(ds);
+    if (!raw || fread(raw, ds, 1, f) != 1) {
+        free(raw); fclose(f); free(out);
+        return NULL;
+    }
+    fclose(f);
+
+    size_t total = frames * fmt.ch;
+    switch (fmt.bps) {
+        case 16:
+        for (size_t i = 0; i < total; i++)
+            out[i] = ((int16_t *)raw)[i] / 32768.0f;
+        break;
+        case 24:
+        for (size_t i = 0; i < total; i++) {
+            int32_t s = (int32_t)(raw[i*3] | ((uint32_t)raw[i*3+1] << 8) |
+                                 ((int32_t)((int8_t)raw[i*3+2]) << 16));
+            out[i] = s / 8388608.0f;
+        }
+        break;
+        case 32:
+        for (size_t i = 0; i < total; i++)
+            out[i] = ((int32_t *)raw)[i] / 2147483648.0f;
+        break;
+        default:
+        free(raw); free(out);
+        LOG_WARN("Unsupported bit depth %u in %s", fmt.bps, path);
+        return NULL;
+    }
+    free(raw);
+
+    LOG_INFO("Loaded %s: %zu frames, %u ch, %u Hz",
+             path, frames, fmt.ch, fmt.rate);
+
+    *frames_out = frames;
+    *ch_out     = (int)fmt.ch;
+    *rate_out   = (int)fmt.rate;
+    return out;
+}
+
+/* Bring a decoded buffer to MIX_RATE/MIX_CHANNELS. Does NOT take ownership
+ * of `in`; the caller frees it either way.
+ *
+ * Mixing is what forces this: with a stream per sample, PipeWire negotiated
+ * a format per stream and converted for us. One shared output buffer means
+ * every sample has to already agree on rate and channel count by the time it
+ * reaches the callback. Doing it here is offline startup work and strictly
+ * better for latency than converting on the graph every cycle. */
+static int sample_conform(const float *in, size_t frames, int ch, int rate,
+                          audio_sample_t *out) {
+    if (!in || frames == 0 || ch <= 0 || rate <= 0) return -1;
+
+    /* 1. Channels. Mono is duplicated rather than left to PipeWire, since
+     *    the mix buffer is a single interleaved layout by then. */
+    float *lay = calloc(frames * MIX_CHANNELS, sizeof(float));
+    if (!lay) return -1;
+    if (ch == 1) {
+        for (size_t i = 0; i < frames; i++)
+            lay[i * 2] = lay[i * 2 + 1] = in[i];
+    } else {
+        if (ch > MIX_CHANNELS)
+            LOG_WARN("Sample has %d channels; using the first %d",
+                     ch, MIX_CHANNELS);
+        for (size_t i = 0; i < frames; i++) {
+            lay[i * 2]     = in[i * (size_t)ch];
+            lay[i * 2 + 1] = in[i * (size_t)ch + 1];
+        }
+    }
+
+    /* 2. Rate. */
+    if (rate == MIX_RATE) {
+        out->samples    = lay;
+        out->num_frames = frames;
+        return 0;
+    }
+
+    double ratio = (double)MIX_RATE / (double)rate;
+    if (!src_is_valid_ratio(ratio)) {
+        LOG_WARN("Cannot resample %d Hz to %d Hz", rate, MIX_RATE);
+        free(lay);
         return -1;
     }
 
-    v->channels    = fmt.ch;
-    v->sample_rate = (int)fmt.rate;
-    v->num_frames  = ds / (fmt.bps / 8u) / fmt.ch;
-    v->samples     = calloc(v->num_frames * v->channels, sizeof(float));
-    if (!v->samples) { fclose(f); return -1; }
+    /* Headroom, not a tight bound: src_simple stops at output_frames and a
+     * cap sitting exactly on the arithmetic answer clips the sinc tail. */
+    size_t cap = (size_t)(frames * ratio) + 16;
+    float *res = calloc(cap * MIX_CHANNELS, sizeof(float));
+    if (!res) { free(lay); return -1; }
 
-    {
-        uint8_t *raw = malloc(ds);
-        if (!raw || fread(raw, ds, 1, f) != 1) {
-            free(raw); fclose(f);
-            free(v->samples); v->samples = NULL;
-            return -1;
-        }
-        fclose(f);
-
-        size_t total = v->num_frames * v->channels;
-        switch (fmt.bps) {
-            case 16:
-            for (size_t i = 0; i < total; i++)
-                v->samples[i] = ((int16_t *)raw)[i] / 32768.0f;
-            break;
-            case 24:
-            for (size_t i = 0; i < total; i++) {
-                int32_t s = (int32_t)(raw[i*3] | ((uint32_t)raw[i*3+1] << 8) |
-                                     ((int32_t)((int8_t)raw[i*3+2]) << 16));
-                v->samples[i] = s / 8388608.0f;
-            }
-            break;
-            case 32:
-            for (size_t i = 0; i < total; i++)
-                v->samples[i] = ((int32_t *)raw)[i] / 2147483648.0f;
-            break;
-            default:
-            free(raw);
-            free(v->samples); v->samples = NULL;
-            return -1;
-        }
-        free(raw);
+    SRC_DATA d = {
+        .data_in       = lay,
+        .input_frames  = (long)frames,
+        .data_out      = res,
+        .output_frames = (long)cap,
+        .src_ratio     = ratio,
+    };
+    int err = src_simple(&d, SRC_SINC_BEST_QUALITY, MIX_CHANNELS);
+    free(lay);
+    if (err) {
+        LOG_WARN("Resample failed: %s", src_strerror(err));
+        free(res);
+        return -1;
     }
 
-    LOG_INFO("Loaded %s: %zu frames, %d ch, %d Hz",
-             path, v->num_frames, v->channels, v->sample_rate);
+    LOG_INFO("Resampled %d Hz -> %d Hz: %zu -> %ld frames",
+             rate, MIX_RATE, frames, d.output_frames_gen);
+    out->samples    = res;
+    out->num_frames = (size_t)d.output_frames_gen;
     return 0;
 }
 
-static void on_process(void *userdata) {
-    audio_voice_t *v = userdata;
-    struct pw_buffer *b;
-    struct spa_buffer *buf;
+/* Take a voice for `s`. RT side, called only from the ring drain.
+ *
+ * Allocating here rather than in audio_trigger is deliberate and is what
+ * keeps the pool atomic-free: a producer that reached into the pool would
+ * need a per-voice flag to claim a slot, which is exactly the per-stream
+ * atomics this design removes. */
+static void mix_voice_alloc(const audio_sample_t *s) {
+    if (!s->samples || s->num_frames == 0) return;
 
-    if ((b = pw_stream_dequeue_buffer(v->stream)) == NULL) {
+    mix_voice_t *v = NULL;
+    for (int i = 0; i < AUDIO_MAX_VOICES; i++) {
+        if (!audio.voice[i].active) { v = &audio.voice[i]; break; }
+    }
+    if (!v) {
+        /* Steal the oldest. Signed difference so a wrapped seq still orders
+         * correctly. Three lines, and in practice unreachable: 32 voices is
+         * far more overlap than two fingers can ask for. */
+        v = &audio.voice[0];
+        for (int i = 1; i < AUDIO_MAX_VOICES; i++)
+            if ((int32_t)(audio.voice[i].seq - v->seq) < 0)
+                v = &audio.voice[i];
+    }
+
+    v->samples = s->samples;
+    v->nframes = s->num_frames;
+    v->gain    = s->gain;
+    v->pos     = 0;
+    v->seq     = audio.seq_next++;
+    v->active  = true;
+}
+
+/* Drain the trigger ring into the voice pool. */
+static void mix_drain_triggers(void) {
+    unsigned t = atomic_load_explicit(&trig.tail, memory_order_relaxed);
+    unsigned h = atomic_load_explicit(&trig.head, memory_order_acquire);
+
+    for (; t != h; t++) {
+        unsigned s = trig.slot[t & (TRIG_RING - 1)];
+        if (s < AUDIO_NSAMPLES)
+            mix_voice_alloc(&audio.sample[s]);
+    }
+
+    atomic_store_explicit(&trig.tail, t, memory_order_release);
+}
+
+/* Render `nframes` of MIX_CHANNELS-interleaved float. The entire mixer, with
+ * no PipeWire in it - tools/mixtest.c calls this directly.
+ *
+ * No malloc, no lock, no syscall: everything it touches is either the ring
+ * (two atomics) or the RT thread's own pool. */
+static void audio_mix(float *dst, size_t nframes) {
+    size_t nsamp = nframes * MIX_CHANNELS;
+
+    mix_drain_triggers();
+    memset(dst, 0, nsamp * sizeof *dst);
+
+    for (int i = 0; i < AUDIO_MAX_VOICES; i++) {
+        mix_voice_t *v = &audio.voice[i];
+        if (!v->active) continue;
+
+        size_t rem = v->nframes - v->pos;
+        size_t n   = nframes < rem ? nframes : rem;
+
+        const float *src = v->samples + v->pos * MIX_CHANNELS;
+        float g = v->gain;
+        for (size_t k = 0; k < n * MIX_CHANNELS; k++)
+            dst[k] += src[k] * g;
+
+        v->pos += n;
+        if (v->pos >= v->nframes) v->active = false;
+    }
+
+    /* Sum into float, then clamp. With realistic overlap this never
+     * engages; a proper limiter would be over-engineering for a click. */
+    for (size_t k = 0; k < nsamp; k++) {
+        if (dst[k] >  1.0f) dst[k] =  1.0f;
+        else if (dst[k] < -1.0f) dst[k] = -1.0f;
+    }
+}
+
+static void on_process(void *userdata) {
+    (void)userdata;
+    struct pw_buffer *b;
+
+    if ((b = pw_stream_dequeue_buffer(audio.stream)) == NULL) {
         pw_log_warn("out of buffers: %m");
         return;
     }
 
-    buf = b->buffer;
+    struct spa_buffer *buf = b->buffer;
     float *dst = buf->datas[0].data;
-    if (!dst) return;
+    if (!dst) { pw_stream_queue_buffer(audio.stream, b); return; }
 
-    int stride = (int)(sizeof(float) * v->channels);
+    int stride = (int)(sizeof(float) * MIX_CHANNELS);
     int n_frames = buf->datas[0].maxsize / stride;
     if (b->requested)
         n_frames = SPA_MIN((int)b->requested, n_frames);
-    size_t nf = (size_t)n_frames;
 
-    if (!atomic_load_explicit(&v->playing, memory_order_acquire) &&
-        atomic_load(&v->pending) > 0) {
-        atomic_store_explicit(&v->playing, true, memory_order_relaxed);
-        atomic_store(&v->frame_pos, 0);
-        atomic_fetch_sub(&v->pending, 1);
-    }
-
-    if (atomic_load_explicit(&v->playing, memory_order_acquire)) {
-        if (atomic_exchange(&v->reset, false))
-            atomic_store(&v->frame_pos, 0);
-
-        size_t pos = atomic_load(&v->frame_pos);
-        size_t rem = v->num_frames - pos;
-        size_t tc  = nf < rem ? nf : rem;
-
-        if (tc > 0) {
-            const float *src = v->samples + pos * v->channels;
-            size_t nsamp = tc * (size_t)v->channels;
-            float g = v->gain;
-            if (g == 1.0f)
-                memcpy(dst, src, nsamp * sizeof(float));
-            else
-                for (size_t i = 0; i < nsamp; i++)
-                    dst[i] = src[i] * g;
-        }
-        if (nf > tc)
-            memset(dst + tc * v->channels, 0, (nf - tc) * (size_t)stride);
-
-        pos += tc;
-        if (pos >= v->num_frames) {
-            atomic_store(&v->playing, false);
-            atomic_store(&v->frame_pos, 0);
-            if (atomic_load(&v->pending) > 0) {
-                atomic_store(&v->playing, true);
-                atomic_store(&v->frame_pos, 0);
-                atomic_fetch_sub(&v->pending, 1);
-            }
-        } else if (atomic_exchange(&v->reset, false)) {
-            atomic_store(&v->frame_pos, 0);
-        } else {
-            atomic_store(&v->frame_pos, pos);
-        }
-    } else {
-        memset(dst, 0, nf * (size_t)stride);
-    }
+    audio_mix(dst, (size_t)n_frames);
 
     buf->datas[0].chunk->offset = 0;
     buf->datas[0].chunk->stride = stride;
-    buf->datas[0].chunk->size   = nf * (size_t)stride;
+    buf->datas[0].chunk->size   = (uint32_t)n_frames * (uint32_t)stride;
 
-    pw_stream_queue_buffer(v->stream, b);
+    pw_stream_queue_buffer(audio.stream, b);
 }
 
 static const struct pw_stream_events stream_events = {
@@ -344,63 +490,46 @@ static int audio_init(void) {
     pw_thread_loop_lock(audio.loop);
     struct pw_loop *pl = pw_thread_loop_get_loop(audio.loop);
 
-    static const char *const voice_name[AUDIO_NVOICES] = {
-        "doubletap-v1", "doubletap-v2"
-    };
+    uint8_t podbuf[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(podbuf, sizeof(podbuf));
+    const struct spa_pod *params[1];
 
-    int connected = 0;
-    for (int i = 0; i < AUDIO_NVOICES; i++) {
-        audio_voice_t *v = &audio.voice[i];
-        if (!v->samples) continue; /* voice with no sample: never plays */
+    struct pw_properties *props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE,     "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Playback",
+        PW_KEY_MEDIA_ROLE,     "Game",
+        NULL);
 
-        uint8_t podbuf[1024];
-        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(podbuf, sizeof(podbuf));
-        const struct spa_pod *params[1];
-
-        struct pw_properties *props = pw_properties_new(
-            PW_KEY_MEDIA_TYPE,     "Audio",
-            PW_KEY_MEDIA_CATEGORY, "Playback",
-            PW_KEY_MEDIA_ROLE,     "Game",
-            NULL);
-
-        /* pass the voice as userdata so on_process knows which one it drives */
-        v->stream = pw_stream_new_simple(pl, voice_name[i], props,
-                                         &stream_events, v);
-        if (!v->stream) continue;
-
-        params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
-            &SPA_AUDIO_INFO_RAW_INIT(
-                .format   = SPA_AUDIO_FORMAT_F32,
-                .channels = v->channels,
-                .rate     = v->sample_rate));
-
-        pw_stream_connect(v->stream,
-                          PW_DIRECTION_OUTPUT,
-                          PW_ID_ANY,
-                          PW_STREAM_FLAG_AUTOCONNECT |
-                          PW_STREAM_FLAG_MAP_BUFFERS  |
-                          PW_STREAM_FLAG_RT_PROCESS,
-                          params, 1);
-        connected++;
-    }
-
-    pw_thread_loop_unlock(audio.loop);
-
-    if (connected == 0) {
+    audio.stream = pw_stream_new_simple(pl, "doubletap", props,
+                                        &stream_events, NULL);
+    if (!audio.stream) {
+        pw_thread_loop_unlock(audio.loop);
         pw_thread_loop_destroy(audio.loop);
         audio.loop = NULL;
         pw_deinit();
         return -1;
     }
 
+    params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
+        &SPA_AUDIO_INFO_RAW_INIT(
+            .format   = SPA_AUDIO_FORMAT_F32,
+            .channels = MIX_CHANNELS,
+            .rate     = MIX_RATE));
+
+    pw_stream_connect(audio.stream,
+                      PW_DIRECTION_OUTPUT,
+                      PW_ID_ANY,
+                      PW_STREAM_FLAG_AUTOCONNECT |
+                      PW_STREAM_FLAG_MAP_BUFFERS  |
+                      PW_STREAM_FLAG_RT_PROCESS,
+                      params, 1);
+
+    pw_thread_loop_unlock(audio.loop);
+
     if (pw_thread_loop_start(audio.loop) < 0) {
         pw_thread_loop_lock(audio.loop);
-        for (int i = 0; i < AUDIO_NVOICES; i++) {
-            if (audio.voice[i].stream) {
-                pw_stream_destroy(audio.voice[i].stream);
-                audio.voice[i].stream = NULL;
-            }
-        }
+        pw_stream_destroy(audio.stream);
+        audio.stream = NULL;
         pw_thread_loop_unlock(audio.loop);
         pw_thread_loop_destroy(audio.loop);
         audio.loop = NULL;
@@ -411,17 +540,27 @@ static int audio_init(void) {
     return 0;
 }
 
-/* voice: 0 == V1, 1 == V2. Each stream restarts independently, so a V1
- * click and a V2 click overlap rather than cutting each other off. */
-static void audio_trigger(int voice) {
+/* sample: 0 == V1, 1 == V2. Pushes onto the trigger ring and returns; the
+ * RT thread turns it into a voice. Every trigger gets its OWN voice, so a
+ * click never cuts off the one before it - not the other key's, and not an
+ * earlier press of the same key.
+ *
+ * PRODUCER SIDE, and there is exactly one producer: the epoll loop. */
+static void audio_trigger(int sample) {
     if (!audio_available) return;
-    if (voice < 0 || voice >= AUDIO_NVOICES) return;
-    audio_voice_t *v = &audio.voice[voice];
-    if (!v->stream) return; /* no sample loaded for this voice */
-    if (atomic_load(&v->playing))
-        atomic_store(&v->reset, true);
-    else
-        atomic_fetch_add(&v->pending, 1);
+    if (sample < 0 || sample >= AUDIO_NSAMPLES) return;
+    if (!audio.sample[sample].samples) return;  /* nothing mapped: silent */
+
+    unsigned h = atomic_load_explicit(&trig.head, memory_order_relaxed);
+    unsigned t = atomic_load_explicit(&trig.tail, memory_order_acquire);
+    if (h - t >= TRIG_RING) {
+        /* Drop it. Never block and never spin: this is called from the
+         * input path, and a stalled epoll loop costs a keypress. */
+        atomic_fetch_add_explicit(&trig.overruns, 1, memory_order_relaxed);
+        return;
+    }
+    trig.slot[h & (TRIG_RING - 1)] = (uint8_t)sample;
+    atomic_store_explicit(&trig.head, h + 1, memory_order_release);
 }
 
 static void audio_cleanup(void) {
@@ -429,24 +568,24 @@ static void audio_cleanup(void) {
     if (audio.loop) {
         pw_thread_loop_stop(audio.loop);
         pw_thread_loop_lock(audio.loop);
-        for (int i = 0; i < AUDIO_NVOICES; i++) {
-            if (audio.voice[i].stream) {
-                pw_stream_destroy(audio.voice[i].stream);
-                audio.voice[i].stream = NULL;
-            }
+        if (audio.stream) {
+            pw_stream_destroy(audio.stream);
+            audio.stream = NULL;
         }
         pw_thread_loop_unlock(audio.loop);
         pw_thread_loop_destroy(audio.loop);
         audio.loop = NULL;
     }
     pw_deinit();
-    for (int i = 0; i < AUDIO_NVOICES; i++) {
-        free(audio.voice[i].samples);
-        audio.voice[i].samples = NULL;
+    unsigned dropped = atomic_load(&trig.overruns);
+    if (dropped)
+        LOG_WARN("%u hitsound trigger(s) dropped on a full ring", dropped);
+    for (int i = 0; i < AUDIO_NSAMPLES; i++) {
+        free(audio.sample[i].samples);
+        audio.sample[i].samples = NULL;
     }
     audio_available = 0;
 }
-
 /* ------------------------------------------------------------------------- */
 /* Config                                                                    */
 /* ------------------------------------------------------------------------- */
@@ -3317,30 +3456,35 @@ main(int argc, char **argv) {
         LOG_INFO("Successfully acquired SCHED_FIFO real-time priority.");
     }
 
-    /* best-effort audio init: resolve per-voice sample + gain (per-key
-     * override falls back to the base wav/gain), load each present voice,
-     * then bring up the streams. Audio stays available if at least one
-     * voice loads. */
+    /* best-effort audio init: resolve each sample's path + gain (a per-key
+     * override falls back to the base wav/gain), decode it, conform it to
+     * the mix format, then bring up the single output stream. Audio stays
+     * available if at least one sample loads. */
     if (cfg.audio_enabled) {
-        const char *wav_paths[AUDIO_NVOICES] = {
+        const char *wav_paths[AUDIO_NSAMPLES] = {
             cfg.wav_v1 ? cfg.wav_v1 : cfg.wav_path,
             cfg.wav_v2 ? cfg.wav_v2 : cfg.wav_path,
         };
-        float gains[AUDIO_NVOICES] = {
+        float gains[AUDIO_NSAMPLES] = {
             cfg.gain_v1 >= 0.0f ? cfg.gain_v1 : cfg.gain,
             cfg.gain_v2 >= 0.0f ? cfg.gain_v2 : cfg.gain,
         };
 
         int loaded = 0;
-        for (int i = 0; i < AUDIO_NVOICES; i++) {
-            if (!wav_paths[i]) continue; /* voice intentionally silent */
-            if (wav_load(wav_paths[i], &audio.voice[i]) == 0) {
-                audio.voice[i].gain = gains[i];
+        for (int i = 0; i < AUDIO_NSAMPLES; i++) {
+            if (!wav_paths[i]) continue; /* intentionally silent */
+
+            size_t frames; int ch, rate;
+            float *raw = wav_load(wav_paths[i], &frames, &ch, &rate);
+            if (raw && sample_conform(raw, frames, ch, rate,
+                                      &audio.sample[i]) == 0) {
+                audio.sample[i].gain = gains[i];
                 loaded++;
             } else {
                 LOG_WARN("V%d hitsound load failed (%s); that key stays silent",
                          i + 1, wav_paths[i]);
             }
+            free(raw);
         }
 
         if (loaded > 0 && audio_init() == 0) {
@@ -3348,9 +3492,9 @@ main(int argc, char **argv) {
             audio_available = 1;
         } else {
             LOG_WARN("Audio disabled (WAV load or PipeWire init failed)");
-            for (int i = 0; i < AUDIO_NVOICES; i++) {
-                free(audio.voice[i].samples);
-                audio.voice[i].samples = NULL;
+            for (int i = 0; i < AUDIO_NSAMPLES; i++) {
+                free(audio.sample[i].samples);
+                audio.sample[i].samples = NULL;
             }
             audio_available = 0;
         }

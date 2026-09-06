@@ -93,10 +93,18 @@ keys:
 #   wav_v1 / wav_v2   - separate samples for the two keys (each falls back
 #                       to `wav` when omitted)
 #   gain_v1 / gain_v2 - separate volumes (each falls back to `gain`)
-# The two voices play on independent streams, so a V1 click and a V2 click
-# overlap rather than cutting each other off. Setting `wav` alongside a
-# single override is fine (not a conflict): the override wins for its key,
-# `wav` covers the other. Point samples at any 16/24/32-bit PCM WAV.
+# Setting `wav` alongside a single override is fine (not a conflict): the
+# override wins for its key, `wav` covers the other. Point samples at any
+# 16/24/32-bit PCM WAV, at any sample rate - the daemon resamples once at
+# startup so everything shares one output.
+#
+# EVERY click overlaps rather than cutting off the one before it, including
+# two presses of the SAME key. The daemon opens a single output node and
+# mixes internally: each press takes its own voice from a pool of 32, and
+# plays out to its end. This matters most at speed - the shipped click is
+# 125ms and a 300 BPM stream is one tap every 50ms, so anything that
+# restarted playback would clip every note of a burst to 40% and thin out
+# the sound exactly when you are listening hardest.
 audio:
   enabled: true
   wav: /usr/share/doubletap/click.wav

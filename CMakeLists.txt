@@ -12,6 +12,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)
 pkg_check_modules(LIBEVDEV REQUIRED libevdev)
 pkg_check_modules(LIBYAML  REQUIRED yaml-0.1)
+pkg_check_modules(SAMPLERATE REQUIRED samplerate)
 
 # Installation directories for the systemd user unit and udev rule. Default
 # to what the host's systemd/udev report; override with -D for packaging.
@@ -42,24 +43,28 @@ target_compile_options(doubletapd PRIVATE
     ${PIPEWIRE_CFLAGS_OTHER}
     ${LIBEVDEV_CFLAGS_OTHER}
     ${LIBYAML_CFLAGS_OTHER}
+    ${SAMPLERATE_CFLAGS_OTHER}
 )
 
 target_include_directories(doubletapd PRIVATE
     ${PIPEWIRE_INCLUDE_DIRS}
     ${LIBEVDEV_INCLUDE_DIRS}
     ${LIBYAML_INCLUDE_DIRS}
+    ${SAMPLERATE_INCLUDE_DIRS}
 )
 
 target_link_directories(doubletapd PRIVATE
     ${PIPEWIRE_LIBRARY_DIRS}
     ${LIBEVDEV_LIBRARY_DIRS}
     ${LIBYAML_LIBRARY_DIRS}
+    ${SAMPLERATE_LIBRARY_DIRS}
 )
 
 target_link_libraries(doubletapd PRIVATE
     ${PIPEWIRE_LIBRARIES}
     ${LIBEVDEV_LIBRARIES}
     ${LIBYAML_LIBRARIES}
+    ${SAMPLERATE_LIBRARIES}
 )
 
 # Developer tools. Not installed, but deliberately part of the default build:
@@ -70,7 +75,8 @@ target_link_libraries(doubletapd PRIVATE
 # had. A few seconds of build time is the cheaper mistake.
 #   ./build/replay TRACE.csv   replay a `doubletapd -T` recording
 #   ./build/regimetest         assertions over the regime
-foreach(tool replay regimetest)
+#   ./build/mixtest            assertions over the audio voice pool
+foreach(tool replay regimetest mixtest)
     add_executable(${tool} tools/${tool}.c)
 
     target_compile_definitions(${tool} PRIVATE
@@ -80,16 +86,20 @@ foreach(tool replay regimetest)
     target_compile_options(${tool} PRIVATE
         -Wall -Wextra
         ${PIPEWIRE_CFLAGS_OTHER} ${LIBEVDEV_CFLAGS_OTHER} ${LIBYAML_CFLAGS_OTHER}
+        ${SAMPLERATE_CFLAGS_OTHER}
     )
     target_include_directories(${tool} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${PIPEWIRE_INCLUDE_DIRS} ${LIBEVDEV_INCLUDE_DIRS} ${LIBYAML_INCLUDE_DIRS}
+        ${SAMPLERATE_INCLUDE_DIRS}
     )
     target_link_directories(${tool} PRIVATE
         ${PIPEWIRE_LIBRARY_DIRS} ${LIBEVDEV_LIBRARY_DIRS} ${LIBYAML_LIBRARY_DIRS}
+        ${SAMPLERATE_LIBRARY_DIRS}
     )
     target_link_libraries(${tool} PRIVATE
         ${PIPEWIRE_LIBRARIES} ${LIBEVDEV_LIBRARIES} ${LIBYAML_LIBRARIES}
+        ${SAMPLERATE_LIBRARIES}
     )
 endforeach()
 
